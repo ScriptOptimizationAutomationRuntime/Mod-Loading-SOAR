@@ -2,19 +2,21 @@
 # SOAR MAIN SYSTEM
 # SOAR - Script Optimization and Automation Runtime
 # Made by Philip Kluz
-# Version 1.00.8 Early Beta
+# Version 1.00.9 Early Beta
 # DO NOT EDIT CORE PARTS.
 # =====================================================
 
 from __future__ import annotations
 
 import ast
+from curses import raw
 import io
 import json
 import os
 import platform
 from pydoc import text
 import random
+import chess # type: ignore
 import queue
 import shlex
 import socket
@@ -1732,6 +1734,59 @@ def reply_to(user_text):
             "Did you know that honey never spoils? Archaeologists have found pots of honey in ancient tombs that are over 3,000 years old."
         ]
         return maybe_address_user(random.choice(facts))
+
+    if text == "chess" or text.startswith("chess "):
+        import chess # type: ignore
+        import random
+
+        try:
+            speak("Choose Difficulty 1 to 10")
+        except Exception:
+            pass
+        
+        diff_str = input("Choose Difficulty (1-10): ")
+        try:
+            difficulty = int(diff_str)
+        except ValueError:
+            difficulty = 1
+            print("Invalid input, defaulting to difficulty 1.")
+
+        board = chess.Board()
+        print("\n--- CHESS ENGINE STARTED ---")
+        print("Type moves in Standard Algebraic Notation (e.g., e4, Nf3, O-O).")
+        print("Type 'quit' to exit the game.\n")
+        
+        while not board.is_game_over():
+            print(f"\n{board}\n")
+            
+            if board.turn == chess.WHITE:
+                user_move = input("Your move (White)> ")
+                if user_move.lower() == 'quit':
+                    return "Chess game ended by the user."
+                try:
+                    board.push_san(user_move)
+                except ValueError:
+                    print("Invalid or illegal move. Please try again.")
+            
+            else:
+                print("SOAR is thinking...")
+                legal_moves = list(board.legal_moves)
+                
+                if difficulty < 5:
+                    ai_move = random.choice(legal_moves)
+                else:
+                    captures = [m for m in legal_moves if board.is_capture(m)]
+                    ai_move = random.choice(captures) if captures else random.choice(legal_moves)
+                    
+                print(f"SOAR plays: {board.san(ai_move)}")
+                board.push(ai_move)
+
+        if board.is_checkmate():
+            winner = "Black (SOAR)" if board.turn == chess.WHITE else "White (You)"
+            return f"Checkmate! {winner} wins!"
+        elif board.is_stalemate() or board.is_insufficient_material():
+            return "The chess game ended in a draw!"
+
     
     if text.startswith("check file ") or text.startswith("checkfile "):
         
@@ -2375,6 +2430,35 @@ def reply_to(user_text):
         except Exception as e:
             print(f"Diagnostics Error: {e}")
             return maybe_address_user("I am unable to poll your hardware diagnostic sensors at this moment.")
+
+    if text.startswith("import ") or text.startswith("importfile "):
+        try:
+            command_body = user_text.strip()[7:] if text.startswith("import ") else user_text.strip()[11:]
+            args = shlex.split(command_body)
+            if not args:
+                return maybe_address_user("I need a file path to import.")
+
+            import_path_str = " ".join(args)
+            import_target = Path(import_path_str).expanduser()
+        
+            if not import_target.exists():
+                return maybe_address_user("That file does not exist. Please check the path.")
+            if not import_target.is_file():
+                return maybe_address_user("The path provided points to a folder, not a file.")
+            
+            imported_content = import_target.read_text(encoding="utf-8")
+        
+            return maybe_address_user(f"Successfully imported '{import_target.name}' ({len(imported_content)} characters).")
+        
+        except Exception as e:
+            return maybe_address_user(f"I encountered an error while trying to import that file: {e}")
+
+# ======================================================
+# FMSS (File Management & Storage System) V 1.0
+# SOAR Help Module #006
+# Made by Philip Kluz 2026 Sep 9 Late
+# "eF em eS eS" 
+#======================================================
         
     if text.startswith("edit file ") or text.startswith("editfile "):
         try:
@@ -2406,7 +2490,7 @@ def reply_to(user_text):
                     for idx, line in enumerate(lines, 1):
                         print(f"[{idx}] {line}")
                 print("============================================================")
-                print("Options: [a]ppend line | [d]elete [num] | [r]eplace [num] | [s]ave | [c]ancel")
+                print("Options: [a]ppend line | [d]elete [num] | [r]eplace [num] | [s]ave | [e]xport | [c]ancel")
                 
                 choice = input("SOAR Editor > ").strip()
                 if not choice:
@@ -2422,7 +2506,27 @@ def reply_to(user_text):
                     target_file.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
                     print("\n[Editor] File successfully saved and updated.")
                     break
-                    
+
+                elif choice_low == 'e':
+                    default_export = DATA_DIR / "soar_drive" / target_file.name
+                    export_input = input(f"Enter export destination path (press Enter for default [{default_export}]): ").strip()
+                    export_path = Path(export_input).expanduser() if export_input else default_export
+                
+                    print("\n[Editor] Exporting to drive...")
+                    for i in range(1, 11):
+                        bar = "#" * i + "-" * (10 - i)
+                        sys.stdout.write(f"\rProgress: [{bar}] {i * 10}%")
+                        sys.stdout.flush()
+                        time.sleep(0.5)
+                    print()
+
+                    try:
+                        export_path.parent.mkdir(parents=True, exist_ok=True)
+                        export_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+                        print(f"[Editor] Successfully exported to: {export_path}")
+                    except Exception as exp_err:
+                        print(f"[Editor Error] Failed to export file: {exp_err}")
+
                 elif choice_low == 'a':
                     new_line = input("Enter text to add as a new line: ")
                     lines.append(new_line)
@@ -2763,7 +2867,7 @@ def reply_to(user_text):
                             "You are SOAR (Script Optimization and Automation Runtime), an advanced, intelligent local desktop AI assistant "
                             "created by Philip Kluz. You are running on a Mac/Windows. You are a custom automated runtime helper built with pure Python.\n\n"
                             "Your current system specifications and architectural capabilities include:\n"
-                            "- Version: 1.00.8 Early Beta.\n"
+                            "- Version: 1.00.9 Early Beta.\n"
                             "- AVSS (Anti Virus SOAR Software): A localized, active protection shield running on a daemon thread monitoring background processes and providing security hardening.\n"
                             "- ACHDS (Advanced Code Helper Diagnostic System): Files outside of soar if upon users request can be fixed.\n"
                             "- CSRS (Connection Server Request System): Can try to widen signal of wifi or network, can also give diagnostics on the wifi.\n"
@@ -4359,6 +4463,7 @@ def process_command(raw, from_voice=False): #mods start 2
     if lower.startswith(math_triggers):
         try:
             import math
+            pass
             
             def parse_advanced_math(raw_expr):
                 cleaned = raw_expr.lower().strip()
@@ -4798,6 +4903,8 @@ def process_command(raw, from_voice=False): #mods start 2
     response = reply_to(text)
     speak(response, allow_sound=True)
 
+
+
 def check_process_resources():
     return False
     """
@@ -5018,9 +5125,14 @@ def watch_intro_and_focus():
     except Exception:
         pass
 
+def handle_user_input(text, username="User"):
+    if text.startswith("/cmd readypost"):
+        print("Ready post command executed internally.")
+        return f"Post readiness confirmed, {username}."
+    
+    return f"Processed input: {text}"
 
 def main():
-
     if soar_avss and hasattr(soar_avss, "enforce_single_instance"):
         soar_avss.enforce_single_instance()
 
@@ -5037,8 +5149,17 @@ def main():
         ("Voice Recognition System", init_recognition)
     ]
 
-    play_intro()
-    threading.Thread(target=watch_intro_and_focus, daemon=True).start()
+    instant_enabled = False
+    try:
+        if SETTINGS_FILE.exists():
+            settings_data = json.loads(SETTINGS_FILE.read_text())
+            instant_enabled = settings_data.get("instant_intro", False)
+    except Exception:
+        pass
+
+    if not instant_enabled:
+        play_intro()
+        threading.Thread(target=watch_intro_and_focus, daemon=True).start()
 
     load_systems(system_tasks)
 
@@ -5073,21 +5194,24 @@ def main():
     threading.Thread(target=resource_watchdog_loop, daemon=True).start()
     threading.Thread(target=autocode_loop, daemon=True).start()
 
-    if intro_start_time > 0:
-        elapsed = time.time() - intro_start_time
-        remaining = 10.0 - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
+    if not instant_enabled:
+        if intro_start_time > 0:
+            elapsed = time.time() - intro_start_time
+            remaining = 10.0 - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
-    close_intro_player()
-    focus_terminal()
+        close_intro_player()
+        focus_terminal()
+    else:
+        focus_terminal()
 
     print(f"{APP_NAME} online.")
     print("Type /help for commands. Type normal text to chat.")
     print("Voice starts automatically if your mic libraries are ready.\n")
 
     try:
-        speak("SOAR Booted, version 1.00.8. Voice is on.", allow_sound=True)
+        speak("SOAR Booted, version 1.00.9. Voice is on.", allow_sound=True)
     except Exception:
         pass
 
@@ -5150,6 +5274,108 @@ def main():
                 raise SystemExit
 
             try:
+                if raw.startswith("/cmd instantintro"):
+                    try:
+                        settings_data = {}
+                        if SETTINGS_FILE.exists():
+                            try:
+                                settings_data = json.loads(SETTINGS_FILE.read_text())
+                            except Exception:
+                                pass
+                        
+                        current_val = settings_data.get("instant_intro", False)
+                        new_val = not current_val
+                        settings_data["instant_intro"] = new_val
+                        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                        SETTINGS_FILE.write_text(json.dumps(settings_data, indent=4))
+                        
+                        status = "enabled (intro will be skipped on next startup)" if new_val else "disabled (intro will play on next startup)"
+                        print(f"Instant intro is now {status}.")
+                    except Exception as e:
+                        print(f"Failed to update instantintro setting: {e}")
+                    continue
+
+                if raw.startswith("/cmd readypost"):
+                    target_files = [
+                        CHAT_LOG,
+                        DATA_DIR / "autocode_log.txt",
+                        BASE_DIR / "autocode_log.txt",
+                        BASE_DIR / "chat_log.txt"
+                    ]
+                    for log_path in target_files:
+                        try:
+                            if log_path.exists():
+                                log_path.write_text("")
+                                print(f"Cleared {log_path.name}")
+                        except Exception as e:
+                            print(f"Could not clear {log_path.name}: {e}")
+                    print("Post readiness confirmed.")
+                    continue
+
+                if raw.startswith("/cmd savelogs"):
+                    saves_dir = DATA_DIR / "log_saves"
+                    saves_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    existing_numbers = []
+                    for folder in saves_dir.iterdir():
+                        if folder.is_dir() and folder.name.startswith("save_"):
+                            try:
+                                existing_numbers.append(int(folder.name.split("_")[1]))
+                            except ValueError:
+                                pass
+                    
+                    next_num = max(existing_numbers, default=0) + 1
+                    save_folder = saves_dir / f"save_{next_num}"
+                    save_folder.mkdir(parents=True, exist_ok=True)
+
+                    chat_src = CHAT_LOG if CHAT_LOG.exists() else BASE_DIR / "chat_log.txt"
+                    auto_src = (DATA_DIR / "autocode_log.txt") if (DATA_DIR / "autocode_log.txt").exists() else BASE_DIR / "autocode_log.txt"
+
+                    if chat_src.exists():
+                        (save_folder / "chat_log.txt").write_text(chat_src.read_text())
+                    if auto_src.exists():
+                        (save_folder / "autocode_log.txt").write_text(auto_src.read_text())
+
+                    print(f"Logs saved to batch #{next_num} ({save_folder})")
+                    continue
+
+                if raw.startswith("/cmd loadlog"):
+                    cmd_parts = raw.strip().split()
+                    
+                    if len(cmd_parts) < 3 or not cmd_parts[2].isdigit():
+                        print("Usage: /cmd loadlog <number>")
+                        continue
+
+                    log_num = cmd_parts[2]
+                    target_folder = DATA_DIR / "log_saves" / f"save_{log_num}"
+
+                    if not target_folder.exists():
+                        print(f"Save slot #{log_num} not found in log_saves.")
+                        continue
+
+                    confirm = input("WARNING: This will clear current logs (Chat history + Autocode log) Proceed? (y/n): ")
+                    if confirm.lower().strip() == "y":
+                        chat_dest = CHAT_LOG
+                        auto_dest = DATA_DIR / "autocode_log.txt"
+
+                        saved_chat = target_folder / "chat_log.txt"
+                        saved_auto = target_folder / "autocode_log.txt"
+
+                        if saved_chat.exists():
+                            chat_dest.write_text(saved_chat.read_text())
+                        else:
+                            chat_dest.write_text("")
+
+                        if saved_auto.exists():
+                            auto_dest.write_text(saved_auto.read_text())
+                        else:
+                            auto_dest.write_text("")
+
+                        print(f"Logs from slot #{log_num} loaded successfully.")
+                    else:
+                        print("Load operation cancelled.")
+                    continue
+
                 process_command(raw)
             except Exception as e:
                 print(f"[COMMAND ERROR] {e}")
