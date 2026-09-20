@@ -13,7 +13,10 @@ import sys
 import threading
 import time
 from statistics import mean
-import soar_avss 
+try:
+    import soar_avss
+except Exception:
+    soar_avss = None
 
 GREEN = "\033[38;5;22m"
 RED = "\033[31m"
@@ -745,20 +748,40 @@ def attempt_recovery_step(attempt_number, score):
         slow_print("NO SWITCH ATTEMPT WAS POSSIBLE.", color=YELLOW)
 
 
+def check_avss_status():
+    """
+    Reports on AVSS's current state without forcing a fresh full scan.
+    A network diagnostic run shouldn't silently trigger a full file/process
+    hash sweep every time - that's AVSS's own job on its own schedule.
+    Returns a dict with at least 'available' and 'suspicious_count'.
+    """
+    if soar_avss is None or not hasattr(soar_avss, "get_report"):
+        return {"available": False, "suspicious_count": 0, "process_hits": 0}
+
+    try:
+        report = soar_avss.get_report(clear=False)
+        report["available"] = True
+        return report
+    except Exception:
+        return {"available": False, "suspicious_count": 0, "process_hits": 0}
+
+
 def auto_recover_until_good(targets, duplicates=None):
     clear_screen()
     
-    section("AVSS SECURITY SWEEP")
-    slow_print("Checking for malicious network interference...", color=CYAN)
-    
-    avss_report = soar_avss.scan_once()
-    
-    if avss_report.get("suspicious_count", 0) > 0:
-        slow_print("[CRITICAL] AVSS detected suspicious background activity!", color=RED)
-        slow_print("Review AVSS logs immediately. Network diagnostics may be compromised.", color=YELLOW)
+    section("AVSS STATUS")
+    slow_print("Checking last known AVSS scan state...", color=CYAN)
+
+    avss_report = check_avss_status()
+
+    if not avss_report.get("available"):
+        slow_print("[INFO] AVSS is not running or not available. Skipping.", color=YELLOW)
+    elif avss_report.get("suspicious_count", 0) > 0:
+        slow_print("[CRITICAL] AVSS has flagged suspicious background activity!", color=RED)
+        slow_print("Review AVSS logs. Network diagnostics may be affected.", color=YELLOW)
         time.sleep(2)
     else:
-        slow_print("[OK] No active network threats detected.", color=GREEN)
+        slow_print("[OK] No active threats in AVSS's last scan.", color=GREEN)
 
     render_overview("run", "run", targets, TIMEOUT_SECONDS, duplicates)
 
@@ -813,15 +836,17 @@ def mode_run(raw, targets, duplicates=None):
     clear_screen()
     
     slow_print("==========================================")
-    slow_print("   RUNNING AVSS SECURITY SWEEP...         ", color=CYAN)
+    slow_print("   AVSS STATUS CHECK...                   ", color=CYAN)
     slow_print("==========================================")
-    
-    avss_report = soar_avss.scan_once()
-    
-    if avss_report.get("suspicious_count", 0) > 0 or avss_report.get("process_hits", 0) > 0:
-        slow_print("[!] WARNING: AVSS flagged potential background security threats!", color=RED)
+
+    avss_report = check_avss_status()
+
+    if not avss_report.get("available"):
+        slow_print("[INFO] AVSS is not running or not available.", color=YELLOW)
+    elif avss_report.get("suspicious_count", 0) > 0 or avss_report.get("process_hits", 0) > 0:
+        slow_print("[!] WARNING: AVSS has flagged potential background security threats!", color=RED)
     else:
-        slow_print("[OK] AVSS scan complete: No active local threats detected.", color=GREEN)
+        slow_print("[OK] No active threats in AVSS's last scan.", color=GREEN)
     
     slow_print("")
     time.sleep(1)
