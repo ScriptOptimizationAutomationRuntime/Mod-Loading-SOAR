@@ -2,21 +2,22 @@
 # SOAR MAIN SYSTEM
 # SOAR - Script Optimization and Automation Runtime
 # Made by Philip Kluz
-# Version 1.00.9 Early Beta
+# Version 1.00.10 Early Beta 
 # DO NOT EDIT CORE PARTS.
 # =====================================================
 
 from __future__ import annotations
 
 import ast
-from curses import raw
+import copy
+import difflib
+import traceback
 import io
 import json
 import os
 import platform
-from pydoc import text
 import random
-import chess # type: ignore
+import re
 import queue
 import shlex
 import socket
@@ -24,7 +25,10 @@ import subprocess
 import sys
 import threading
 import time
-import psutil
+try:
+    import psutil
+except Exception:
+    psutil = None
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +36,10 @@ from textwrap import dedent
 from urllib.parse import quote_plus
 import urllib.request
 import ssl
-import certifi
+try:
+    import certifi
+except Exception:
+    certifi = None
 
 pronoun = "sir" # you can change this to prefered pronoun.
 _last_resource_alert = 0
@@ -64,11 +71,6 @@ except Exception:
     soar_avss = None
 
 try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
-
-try:
     import rsms  # type: ignore
 except Exception:
     rsms = None
@@ -85,6 +87,66 @@ TODO_FILE = DATA_DIR / "todos.txt"
 CHAT_LOG = DATA_DIR / "chat_log.txt"
 MODS_DIR = BASE_DIR / "soar-mods"
 
+GROQ_API_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_DEFAULT_MODEL = "openai/gpt-oss-20b"
+GROQ_REQUEST_TIMEOUT = 25
+GROQ_SYSTEM_PROMPT = (
+    "You are SOAR, the Script Optimization and Automation Runtime. "
+    "Answer naturally and concisely, be helpful and honest, and do not claim "
+    "to have performed actions that SOAR did not actually perform. "
+    "When the user asks for a local SOAR command, the command handler has already "
+    "processed it; here you are handling ordinary conversation."
+)
+GROQ_FALLBACK_KEY = ""
+_groq_last_error = ""
+_groq_last_error_time = 0.0
+
+BRAIN_MEMORY_FILE = DATA_DIR / "brain_memory.json"
+BRAIN_KNOWLEDGE_FILE = DATA_DIR / "brain_knowledge.json"
+BRAIN_LEARNING_FILE = DATA_DIR / "brain_learning.json"
+
+BRAIN_DEFAULT_KNOWLEDGE = {
+    "soar": {
+        "name": "Script Optimization and Automation Runtime"
+    },
+    "python": {
+        "type": "programming language"
+    }
+}
+
+PROFILES_FILE = DATA_DIR / "profiles.json"
+SCHEDULE_FILE = DATA_DIR / "scheduler.json"
+ALIASES_FILE = DATA_DIR / "aliases.json"
+WORKSPACES_FILE = DATA_DIR / "workspaces.json"
+CLIPBOARD_HISTORY_FILE = DATA_DIR / "clipboard_history.json"
+COMMAND_HISTORY_FILE = DATA_DIR / "command_history.txt"
+EVENT_LOG_FILE = DATA_DIR / "events.log"
+
+SOAR_SAFE_MODE = False
+SOAR_ACTIVE_PROFILE = "default"
+SOAR_MANUAL_DISABLED_MODULES = set()
+SOAR_AUTO_LIGHTWEIGHT_ACTIVE = False
+SOAR_AUTO_LIGHTWEIGHT_ENABLED = True
+SOAR_AUTO_LIGHTWEIGHT_LOW_SINCE = None
+
+MODULE_HEALTH = {
+    "CORE": {"status": "healthy", "failures": 0, "last_error": "", "last_error_time": ""},
+    "VOICE": {"status": "unknown", "failures": 0, "last_error": "", "last_error_time": ""},
+    "AUTOCODE": {"status": "unknown", "failures": 0, "last_error": "", "last_error_time": ""},
+    "AVSS": {"status": "unknown", "failures": 0, "last_error": "", "last_error_time": ""},
+    "RSMS": {"status": "unknown", "failures": 0, "last_error": "", "last_error_time": ""},
+    "CSRS": {"status": "unknown", "failures": 0, "last_error": "", "last_error_time": ""},
+    "SCHEDULER": {"status": "unknown", "failures": 0, "last_error": "", "last_error_time": ""},
+}
+
+SCHEDULE_THREAD = None
+SCHEDULE_STOP_EVENT = threading.Event()
+EVENT_HANDLERS = {}
+FEATURE_RUNTIME_READY = False
+COMMAND_HISTORY_LIMIT = 500
+CLIPBOARD_HISTORY_LIMIT = 20
+
+
 for p in [DATA_DIR, PROJECTS_DIR, NOTES_FILE, MEMORY_FILE, TODO_FILE, CHAT_LOG, SETTINGS_FILE]:
     if p == DATA_DIR or p == PROJECTS_DIR:
         p.mkdir(parents=True, exist_ok=True)
@@ -93,8 +155,33 @@ for p in [DATA_DIR, PROJECTS_DIR, NOTES_FILE, MEMORY_FILE, TODO_FILE, CHAT_LOG, 
 
 STARTUP_TIME = datetime.now()
 
+for brain_path, brain_default in (
+    (BRAIN_MEMORY_FILE, {}),
+    (BRAIN_KNOWLEDGE_FILE, BRAIN_DEFAULT_KNOWLEDGE),
+    (BRAIN_LEARNING_FILE, {"aliases": {}, "responses": {}}),
+):
+    if not brain_path.exists():
+        brain_path.write_text(
+            json.dumps(brain_default, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+
 autocode_enabled = False
 autocode_stop = threading.Event()
+
+SOAR_RESOURCE_LIMITS = {
+    "ram_bytes": None,
+    "cpu_percent": None,
+    "gpu_percent": None,
+}
+
+SOAR_RESOURCE_LIMITS_ACTIVE = False
+RESOURCE_WATCHDOG_INTERVAL = 10.0
+
+SOAR_LIGHTWEIGHT_MODE = False
+SOAR_DISABLED_MODULES = set()
+avss_stop_event = threading.Event()
+resource_limit_lock = threading.Lock()
 
 stop_event = threading.Event()
 bot_lock = threading.Lock()
@@ -122,7 +209,11 @@ SETTINGS_CACHE = None
 tts_voice_label = None
 tts_voice_id = None
 
-ssl_context = ssl.create_default_context(cafile=certifi.where())
+ssl_context = (
+    ssl.create_default_context(cafile=certifi.where())
+    if certifi is not None
+    else ssl.create_default_context()
+)
 
 # ======================================================
 # SPA (SOAR Project Agent) V 1.0
@@ -141,8 +232,7 @@ class ProjectAgent:
         self.prompt = prompt.strip()
         self.project_name = project_name.strip().replace(" ", "_")
         
-        current_script_dir = Path(__file__).resolve().parent
-        self.project_dir = current_script_dir / "projects" / self.project_name
+        self.project_dir = PROJECTS_DIR / self.project_name
         
         self.logs = []
         self.project_type = self._determine_project_type()
@@ -510,8 +600,6 @@ def load_configurations():
 def verify_security():
     time.sleep(0.6)
 
-import threading
-
 
 def load_systems(tasks):
     total_tasks = len(tasks)
@@ -565,42 +653,193 @@ def load_systems(tasks):
 def default_settings():
     return {
         "voice_preference": "auto",
+        "active_profile": "default",
+        "safe_mode": False,
+        "auto_lightweight": True,
+        "module_overrides": [],
+        "groq_enabled": True,
+        "groq_api_key": "", #api key here
+        "groq_model": GROQ_DEFAULT_MODEL, #groq model here
         "personality": {
-            "Respectiveness": 0.85, # 0.85
-            "Humor": 0.4, # 0.4
-            "Honesty": 0.9, # 0.9   
-            "Comfort": 0.7, # 0.7     
+            "Respectiveness": 0.85,
+            "Humor": 0.4,
+            "Honesty": 0.9,
+            "Comfort": 0.7,
         }
     }
+
+
+def _deep_merge_dict(base, override):
+    result = copy.deepcopy(base)
+    if isinstance(override, dict):
+        for key, value in override.items():
+            if isinstance(value, dict) and isinstance(result.get(key), dict):
+                result[key] = _deep_merge_dict(result[key], value)
+            else:
+                result[key] = copy.deepcopy(value)
+    return result
 
 
 def load_settings():
     global SETTINGS_CACHE
     with SETTINGS_LOCK:
         if SETTINGS_CACHE is not None:
-            return dict(SETTINGS_CACHE)
+            return copy.deepcopy(SETTINGS_CACHE)
 
         data = default_settings()
         try:
             if SETTINGS_FILE.exists() and SETTINGS_FILE.read_text(encoding="utf-8").strip():
                 loaded = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
-                    data.update(loaded)
+                    data = _deep_merge_dict(data, loaded)
         except Exception as e:
             print(f"[{stamp()}] [SETTINGS ERROR] Failed to load configuration: {e}")
 
         SETTINGS_CACHE = data
-        return dict(data)
+        return copy.deepcopy(data)
 
 
 def save_settings(settings):
     global SETTINGS_CACHE
     with SETTINGS_LOCK:
-        merged = default_settings()
-        if isinstance(settings, dict):
-            merged.update(settings)
+        merged = _deep_merge_dict(default_settings(), settings if isinstance(settings, dict) else {})
         SETTINGS_CACHE = merged
-        SETTINGS_FILE.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
+        SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SETTINGS_FILE.write_text(
+            json.dumps(merged, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+
+
+def get_groq_api_key():
+    """Return the Groq key without ever printing it."""
+    env_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    configured = load_settings().get("groq_api_key", "")
+    if configured:
+        return str(configured).strip()
+
+    return GROQ_FALLBACK_KEY.strip()
+
+
+def get_groq_model():
+    model = str(load_settings().get("groq_model", GROQ_DEFAULT_MODEL) or GROQ_DEFAULT_MODEL).strip()
+    return model or GROQ_DEFAULT_MODEL
+
+
+def is_groq_enabled():
+    return bool(load_settings().get("groq_enabled", True))
+
+
+def set_groq_enabled(enabled):
+    settings = load_settings()
+    settings["groq_enabled"] = bool(enabled)
+    save_settings(settings)
+
+
+def groq_status_text():
+    enabled = is_groq_enabled()
+    key_present = bool(get_groq_api_key())
+    state = "on" if enabled else "off"
+    key_state = "configured" if key_present else "missing"
+    return f"Groq chat is {state}; API key is {key_state}; model: {get_groq_model()}."
+
+
+def _groq_report_error(message):
+    global _groq_last_error, _groq_last_error_time
+    now = time.time()
+    _groq_last_error = str(message)
+    if now - _groq_last_error_time >= 30:
+        print(f"[GROQ] {message} Using local SOAR chat fallback for this request.")
+        _groq_last_error_time = now
+
+
+def _groq_context_messages():
+    messages = []
+    for entry in BRAIN_CONTEXT[-8:]:
+        if not isinstance(entry, dict):
+            continue
+        user_msg = str(entry.get("user") or "").strip()
+        assistant_msg = str(entry.get("response") or "").strip()
+        if user_msg:
+            messages.append({"role": "user", "content": user_msg})
+        if assistant_msg:
+            messages.append({"role": "assistant", "content": assistant_msg})
+    return messages[-12:]
+
+
+def groq_chat(user_text):
+    """Ask Groq for ordinary chat; return None when disabled/unconfigured/offline."""
+    if not is_groq_enabled():
+        return None
+
+    api_key = get_groq_api_key()
+    if not api_key:
+        _groq_report_error("No GROQ_API_KEY is configured.")
+        return None
+
+    user_text = str(user_text or "").strip()
+    if not user_text:
+        return None
+
+    messages = [{"role": "system", "content": GROQ_SYSTEM_PROMPT}]
+    messages.extend(_groq_context_messages())
+    messages.append({"role": "user", "content": user_text})
+
+    payload = {
+        "model": get_groq_model(),
+        "messages": messages,
+        "temperature": 0.7,
+        "max_completion_tokens": 1024,
+    }
+
+    request = urllib.request.Request(
+        GROQ_API_ENDPOINT,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": f"{APP_NAME}/1.00.10",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=GROQ_REQUEST_TIMEOUT,
+            context=ssl_context,
+        ) as response:
+            body = response.read().decode("utf-8", errors="replace")
+
+        data = json.loads(body)
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("Groq returned no choices")
+
+        message = choices[0].get("message", {})
+        content = message.get("content") if isinstance(message, dict) else None
+        if not content:
+            raise ValueError("Groq returned an empty response")
+
+        return str(content).strip()
+
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            detail = str(e)
+        _groq_report_error(f"HTTP {e.code}: {detail}")
+    except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+        _groq_report_error(f"Network unavailable: {e}")
+    except json.JSONDecodeError as e:
+        _groq_report_error(f"Invalid JSON response: {e}")
+    except Exception as e:
+        _groq_report_error(f"Request failed: {e}")
+
+    return None
 
 
 def get_voice_preference():
@@ -805,6 +1044,7 @@ def load_soar_mods():
 
 load_soar_mods() #mods end 1
 
+
 def show_voice_status():
     pref = get_voice_preference()
     print()
@@ -865,7 +1105,7 @@ def maybe_address_user(text, chance=0.25):
     if random.random() < respect_score:
         cleaned = text.rstrip(".!?")
         if respect_score > 0.8:
-            title = ", {pronoun}."
+            title = f", {pronoun}."
         elif respect_score > 0.4:
             title = ", friend."
         else:
@@ -1060,12 +1300,8 @@ def normalize_path(text, allow_create=True):
 
     return path
 
-
 def autocode_connected():
     return soar_autocode is not None and hasattr(soar_autocode, "run_cycle")
-
-
-
 
 def show_autocode_status():
     print()
@@ -1212,7 +1448,13 @@ def tts_worker():
             if item is None:
                 break
 
-            text = str(item).strip()
+            if isinstance(item, tuple):
+                text = str(item[0]).strip() if item else ""
+                gender = str(item[1]).strip().lower() if len(item) > 1 else "default"
+            else:
+                text = str(item).strip()
+                gender = "default"
+
             if not text:
                 continue
 
@@ -1528,7 +1770,8 @@ def show_help():
         "remind, timer, shell, read, write, open, openurl, copy, paste, ip, status, voice, voice on, "
         "voice off, voice list, voice set <name>, voice auto, listen on, listen off, code, mkdir, "
         "newfile <path> <optional text>, projects, data, logs, log tail, autocode, autocode status, autocode on, autocode off, "
-        "flip a coin, roll a dice, fact, story."
+        "flip a coin, roll a dice, fact, story, /cmd limitres, /cmd limitres off, /cmd lightmode, /cmd lightmode off, "
+        "/cmd groqkeyon, /cmd groqkeyoff, /cmd groqkeystatus."
     )
     print()
     print(text)
@@ -1550,7 +1793,25 @@ def show_status():
     print(f"  local ip: {get_local_ip()}")
     print(f"  uptime: {str(datetime.now() - STARTUP_TIME).split('.')[0]}")
     print(f"  chat log: {CHAT_LOG}")
+    with resource_limit_lock:
+        resource_active = SOAR_RESOURCE_LIMITS_ACTIVE
+        resource_ram = SOAR_RESOURCE_LIMITS.get("ram_bytes")
+        resource_cpu = SOAR_RESOURCE_LIMITS.get("cpu_percent")
+        resource_gpu = SOAR_RESOURCE_LIMITS.get("gpu_percent")
+    print(f"  resource limits: {'active this boot' if resource_active else 'off'}")
+    if resource_active:
+        print(f"  resource RAM limit: {resource_ram / (1024 ** 2):.1f} MB" if resource_ram else "  resource RAM limit: off")
+        print(f"  resource CPU limit: {resource_cpu}%" if resource_cpu else "  resource CPU limit: off")
+        print(f"  resource GPU limit: {resource_gpu}%" if resource_gpu else "  resource GPU limit: off")
+    print(f"  profile: {SOAR_ACTIVE_PROFILE}")
+    print(f"  safe mode: {'on' if SOAR_SAFE_MODE else 'off'}")
+    print(f"  auto-lightweight: {'on' if SOAR_AUTO_LIGHTWEIGHT_ENABLED else 'off'}")
+    print(f"  current mode: {'lightweight' if SOAR_LIGHTWEIGHT_MODE else 'normal'}")
+    print(f"  disabled modules: {', '.join(sorted(SOAR_DISABLED_MODULES)) or 'none'}")
     print(f"  autocode: {'connected' if autocode_connected() else 'offline'}")
+    print(f"  groq chat: {'on' if is_groq_enabled() else 'off'}")
+    print(f"  groq key: {'configured' if get_groq_api_key() else 'missing'}")
+    print(f"  groq model: {get_groq_model()}")
     if autocode_connected() and hasattr(soar_autocode, "load_state"):
         try:
             auto_state = soar_autocode.load_state()
@@ -1577,38 +1838,6 @@ def show_recent_log(count=20):
         print(line)
 
 def analyze_code_syntax(file_path):
-    """
-    Scans a Python file for compilation errors and provides 
-    a clear, helpful explanation for a developer.
-    """
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            source = f.read()
-        
-        
-        compile(source, file_path, 'exec')
-        return "No syntax errors detected! The structure looks clean."
-        
-    except SyntaxError as e:
-        explanation = "Hint: Check for missing colons (:), unclosed parentheses (), or mismatched quotes."
-        if "expected ':'" in str(e):
-            explanation = "Hint: You forgot a colon ':' at the end of an 'if', 'for', 'while', or 'def' statement."
-        elif "unmatched" in str(e):
-            explanation = "Hint: You have an open parenthesis '(', bracket '[', or brace '{' that never got closed."
-        elif "indentation" in str(e).lower():
-            explanation = "Hint: Your spacing is uneven. Make sure you are consistently using either 4 spaces or tabs."
-
-        return (
-            f"[SYNTAX ERROR FOUND]\n"
-            f"  File: {os.path.basename(file_path)}\n"
-            f"  Line {e.lineno}: {e.text.strip() if e.text else 'Unknown text'}\n"
-            f"  Error: {e.msg}\n"
-            f"  {explanation}"
-        )
-    except Exception as e:
-        return f"Could not analyze file structure: {e}"
-
-def analyze_code_syntax(file_path):
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             source = f.read()
@@ -1634,6 +1863,1511 @@ def analyze_code_syntax(file_path):
         )
     except Exception as e:
         return f"Could not analyze file structure: {e}"
+
+def _brain_load_json(path, default):
+    try:
+        if not path.exists():
+            path.write_text(
+                json.dumps(default, indent=2, ensure_ascii=False),
+                encoding="utf-8"
+            )
+            return json.loads(json.dumps(default, ensure_ascii=False))
+
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            return json.loads(json.dumps(default, ensure_ascii=False))
+
+        data = json.loads(content)
+        return data
+    except Exception:
+        return json.loads(json.dumps(default, ensure_ascii=False))
+
+
+def _brain_save_json(path, data):
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
+    temp_path.replace(path)
+
+
+def _brain_key(text):
+    return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_")
+
+
+def _brain_tokens(text):
+    return re.findall(r"\b[a-z0-9]+(?:['-][a-z0-9]+)*\b", normalize_text(text))
+
+
+def _brain_phrase_tokens(phrase):
+    return re.findall(r"\b[a-z0-9]+(?:['-][a-z0-9]+)*\b", normalize_text(phrase))
+
+
+def _brain_has_phrase(text, phrase):
+    source = _brain_tokens(text)
+    target = _brain_phrase_tokens(phrase)
+
+    if not source or not target or len(target) > len(source):
+        return False
+
+    width = len(target)
+    for index in range(len(source) - width + 1):
+        if source[index:index + width] == target:
+            return True
+
+    return False
+
+
+def _brain_has_any_phrase(text, phrases):
+    return any(_brain_has_phrase(text, phrase) for phrase in phrases)
+
+
+def _brain_remove_leading_prefix(text):
+    value = normalize_text(text)
+
+    prefixes = [
+        r"^(?:hey|hello|hi|yo),?\s+(?:soar|so)\b[,:-]?\s*",
+        r"^(?:hey|hello|hi|yo)\b[,:-]?\s*",
+        r"^(?:soar|so)\b[,:-]?\s*",
+    ]
+
+    changed = True
+    while changed:
+        changed = False
+        for pattern in prefixes:
+            updated = re.sub(pattern, "", value, count=1).strip()
+            if updated != value:
+                value = updated
+                changed = True
+
+    return value
+
+
+def normalize_text(text):
+    value = str(text or "").strip().lower()
+    value = value.replace("’", "'").replace("“", '"').replace("”", '"')
+
+    replacements = {
+        r"\bwhat's\b": "what is",
+        r"\bwhats\b": "what is",
+        r"\bwho's\b": "who is",
+        r"\bwhos\b": "who is",
+        r"\bhow's\b": "how is",
+        r"\bhowre\b": "how are",
+        r"\bhow're\b": "how are",
+        r"\bcan't\b": "cannot",
+        r"\bcant\b": "cannot",
+        r"\bdon't\b": "do not",
+        r"\bdont\b": "do not",
+        r"\bdoesn't\b": "does not",
+        r"\bdoesnt\b": "does not",
+        r"\bisn't\b": "is not",
+        r"\bisnt\b": "is not",
+        r"\baren't\b": "are not",
+        r"\barent\b": "are not",
+        r"\bit's\b": "it is",
+        r"\bits\b": "it is",
+        r"\bi'm\b": "i am",
+        r"\bim\b": "i am",
+        r"\byou're\b": "you are",
+        r"\byoure\b": "you are",
+        r"\bwe're\b": "we are",
+        r"\bwere\b": "were",
+        r"\bi've\b": "i have",
+        r"\bive\b": "i have",
+    }
+
+    for pattern, replacement in replacements.items():
+        value = re.sub(pattern, replacement, value)
+
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _brain_topic_from_question(text):
+    cleaned = _brain_remove_leading_prefix(text).strip(" ?!.,")
+    patterns = [
+        r"^(?:what is|who is|what are|who are|tell me about|define|explain)\s+(.+?)\s*$",
+        r"^(?:what do you know about)\s+(.+?)\s*$",
+        r"^(?:what is the meaning of)\s+(.+?)\s*$",
+        r"^(?:what does)\s+(.+?)\s+mean\s*$",
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, cleaned, re.IGNORECASE)
+        if not match:
+            continue
+
+        topic = match.group(1).strip(" ?!.,")
+        topic = re.sub(r"^(?:the|a|an)\s+", "", topic).strip()
+        if topic:
+            return topic
+
+    return None
+
+
+def _brain_extract_activity(text):
+    cleaned = _brain_remove_leading_prefix(text).strip(" .?!")
+    patterns = [
+        r"^(?:i am|i was|we are|we were)\s+(?:currently\s+)?(?:working on|doing|building|making|developing|coding|testing|fixing|studying|learning)\s+(.+)$",
+        r"^(?:i am|i was|we are|we were)\s+(.+?)\s+(?:right now|today)$",
+        r"^(?:working on|building|making|developing|coding|testing|fixing|studying|learning)\s+(.+)$",
+    ]
+
+    for pattern in patterns:
+        match = re.match(pattern, cleaned, re.IGNORECASE)
+        if match:
+            activity = match.group(1).strip(" .?!")
+            if activity:
+                return activity
+
+    return None
+
+
+def _brain_question_about_self(text):
+    return _brain_has_any_phrase(text, {
+        "what is your name",
+        "what are you",
+        "who are you",
+        "what do you do",
+        "what can you do",
+        "how are you",
+        "how is it going",
+        "how are things",
+        "everything good",
+        "you doing alright",
+        "are you okay",
+        "what are you doing",
+        "are you there",
+    })
+
+
+def extract_entities(text):
+    normalized = normalize_text(text)
+    cleaned = _brain_remove_leading_prefix(normalized)
+    tokens = _brain_tokens(cleaned)
+    numbers = []
+
+    for match in re.findall(r"(?<![\w.])-?\d+(?:\.\d+)?", cleaned):
+        try:
+            value = float(match)
+            numbers.append(int(value) if value.is_integer() else value)
+        except Exception:
+            pass
+
+    entities = {
+        "tokens": tokens,
+        "numbers": numbers,
+        "memory_key": None,
+        "memory_value": None,
+        "topic": None,
+        "math_expression": None,
+        "comparison": None,
+        "activity": _brain_extract_activity(cleaned),
+        "referent": None,
+        "subject": None,
+    }
+
+    memory_patterns = [
+        r"^my\s+(.+?)\s+is\s+(.+)$",
+        r"^my\s+(.+?)\s+are\s+(.+)$",
+        r"^the\s+(.+?)\s+is\s+(.+)$",
+        r"^i\s+prefer\s+(.+?)\s+for\s+(.+)$",
+    ]
+
+    for pattern in memory_patterns:
+        match = re.match(pattern, cleaned)
+        if match:
+            if "prefer" in pattern:
+                key_text = match.group(2).strip()
+                value_text = match.group(1).strip()
+            else:
+                key_text = match.group(1).strip()
+                value_text = match.group(2).strip()
+
+            if key_text and value_text:
+                entities["memory_key"] = _brain_key(key_text)
+                entities["memory_value"] = value_text
+                break
+
+    topic = _brain_topic_from_question(cleaned)
+    if topic:
+        entities["topic"] = _brain_key(topic)
+        entities["subject"] = topic
+
+    math_candidate = cleaned
+    word_math = [
+        (r"\bplus\b", "+"),
+        (r"\bminus\b", "-"),
+        (r"\btimes\b", "*"),
+        (r"\bmultiplied\s+by\b", "*"),
+        (r"\bdivided\s+by\b", "/"),
+    ]
+
+    for pattern, replacement in word_math:
+        math_candidate = re.sub(pattern, replacement, math_candidate)
+
+    math_candidate = re.sub(
+        r"^(?:what is|calculate|compute|solve)\s+",
+        "",
+        math_candidate
+    ).strip(" ?!")
+
+    if (
+        re.fullmatch(r"[0-9+\-*/%^().\s]+", math_candidate or "") and
+        any(ch.isdigit() for ch in math_candidate) and
+        any(op in math_candidate for op in "+-*/%^")
+    ):
+        entities["math_expression"] = math_candidate
+
+    comparison_match = re.search(
+        r"(?:is|are)\s+(-?\d+(?:\.\d+)?)\s+"
+        r"(greater than|less than|equal to|at least|at most|above|below)\s+"
+        r"(-?\d+(?:\.\d+)?)",
+        cleaned
+    )
+
+    if comparison_match:
+        entities["comparison"] = (
+            float(comparison_match.group(1)),
+            comparison_match.group(2),
+            float(comparison_match.group(3)),
+        )
+
+    if _brain_has_any_phrase(cleaned, {"multiply that by", "divide that by", "add that to", "subtract that from", "double that", "triple that", "half that"}):
+        entities["referent"] = "last_result"
+    elif _brain_has_any_phrase(cleaned, {"what was i doing", "what am i doing", "what were we doing", "what are we doing", "what were we working on", "what am i working on", "continue that", "continue this", "what was that about", "what did we just do", "what did we talk about"}):
+        entities["referent"] = "conversation"
+    elif re.search(r"\b(?:it|that|this|those|they)\b", cleaned):
+        entities["referent"] = "conversation"
+
+    return entities
+
+
+def detect_intent(text):
+    normalized = normalize_text(text)
+
+    if not normalized:
+        return "UNKNOWN"
+
+    greeting_phrases = {
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "sup",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "what is up",
+        "hi soar",
+        "hello soar",
+        "hey soar",
+        "yo soar",
+        "hi so",
+        "hey so",
+        "hello so",
+        "yo so",
+    }
+
+    greeting_check = normalized.strip(" ?!.,")
+
+    if greeting_check in greeting_phrases:
+        return "GREETING"
+
+    cleaned = _brain_remove_leading_prefix(normalized)
+
+    if not cleaned:
+        return "GREETING"
+
+    if cleaned.startswith("/"):
+        return "COMMAND"
+
+    if cleaned in {
+        "bye",
+        "goodbye",
+        "see you",
+        "see ya",
+        "later",
+        "good night",
+    }:
+        return "GOODBYE"
+
+    if cleaned in {
+        "help",
+        "help me",
+        "commands",
+        "what can you do",
+        "how do i use you",
+    }:
+        return "HELP"
+
+    if _brain_has_any_phrase(cleaned, {
+        "remember",
+        "memorize this",
+        "save this",
+        "store this",
+        "learn that",
+        "teach yourself",
+        "add alias",
+        "when i say",
+    }) or _brain_extract_activity(cleaned) and _brain_has_any_phrase(cleaned, {"remember that", "save that"}):
+        return "MEMORY_SAVE"
+
+    if _brain_has_any_phrase(cleaned, {
+        "what is my",
+        "what are my",
+        "do you remember my",
+        "do you remember",
+        "what do you remember",
+        "remember anything about me",
+        "what did i tell you",
+        "what do you know about me",
+        "what was i doing",
+        "what am i doing",
+        "what was i working on",
+        "what am i working on",
+        "what were we doing",
+        "what are we doing",
+        "what were we working on",
+        "what did we just do",
+        "what did we talk about",
+        "what were we talking about",
+        "what was the last thing i asked",
+        "what did i just ask",
+        "what was my last question",
+        "what was that about",
+        "continue that",
+        "continue this",
+        "keep going",
+        "where were we",
+        "pick up where we left off",
+        "remind me what i was doing",
+    }):
+        return "MEMORY_REQUEST"
+
+    if _brain_extract_activity(cleaned):
+        return "CONTEXT_UPDATE"
+
+    if _brain_has_any_phrase(cleaned, {
+        "calculate",
+        "compute",
+        "solve",
+        "what is",
+        "how much is",
+        "add",
+        "subtract",
+        "multiply",
+        "divide",
+        "double that",
+        "triple that",
+        "half that",
+        "plus",
+        "minus",
+        "times",
+        "multiplied by",
+        "divided by",
+    }):
+        entities = extract_entities(cleaned)
+        if entities.get("math_expression") or len(entities.get("numbers", [])) >= 2 or entities.get("comparison"):
+            return "CALCULATION"
+
+    if _brain_has_any_phrase(cleaned, {
+        "how is it going",
+        "how are you",
+        "how are things",
+        "you doing alright",
+        "everything good",
+        "are you okay",
+        "are you there",
+        "what are you doing",
+        "who are you",
+        "what is your name",
+    }):
+        return "QUESTION"
+
+    if re.search(
+        r"\b(?:greater than|less than|equal to|at least|at most|above|below)\b",
+        cleaned
+    ):
+        return "QUESTION"
+
+    question_starters = {
+        "what",
+        "who",
+        "where",
+        "when",
+        "why",
+        "how",
+        "is",
+        "are",
+        "can",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+    }
+
+    tokens = _brain_tokens(cleaned)
+    if cleaned.endswith("?") or (tokens and tokens[0] in question_starters):
+        return "QUESTION"
+
+    request_starters = {
+        "please",
+        "could",
+        "can",
+        "would",
+        "show",
+        "give",
+        "tell",
+        "find",
+        "make",
+        "get",
+        "open",
+        "start",
+    }
+
+    if tokens and tokens[0] in request_starters:
+        return "REQUEST"
+
+    return "UNKNOWN"
+
+
+def check_memory(key=None, value=None):
+    memories = _brain_load_json(BRAIN_MEMORY_FILE, {})
+
+    if not isinstance(memories, dict):
+        return None if key is not None else []
+
+    if key is not None:
+        target = _brain_key(key)
+
+        if target in memories:
+            return memories[target]
+
+        target_tokens = set(_brain_tokens(key))
+        best_key = None
+        best_score = 0.0
+
+        for stored_key in memories:
+            stored_tokens = set(_brain_tokens(stored_key.replace("_", " ")))
+            overlap = (
+                len(target_tokens & stored_tokens) /
+                max(1, len(target_tokens | stored_tokens))
+            )
+            sequence = difflib.SequenceMatcher(
+                None,
+                target,
+                stored_key
+            ).ratio()
+            score = max(overlap, sequence)
+
+            if score > best_score:
+                best_score = score
+                best_key = stored_key
+
+        if best_key is not None and best_score >= 0.72:
+            return memories[best_key]
+
+        return None
+
+    if value is not None:
+        target = normalize_text(value)
+        return [
+            (stored_key, stored_value)
+            for stored_key, stored_value in memories.items()
+            if target in normalize_text(str(stored_value))
+        ]
+
+    return memories
+
+
+def save_memory(key, value):
+    memories = _brain_load_json(BRAIN_MEMORY_FILE, {})
+
+    if not isinstance(memories, dict):
+        memories = {}
+
+    clean_key = _brain_key(key)
+    clean_value = str(value).strip()
+
+    if not clean_key or not clean_value:
+        return False
+
+    memories[clean_key] = clean_value
+    _brain_save_json(BRAIN_MEMORY_FILE, memories)
+
+    try:
+        existing = read_lines(MEMORY_FILE)
+        entry = f"{clean_key} = {clean_value}"
+        filtered = [
+            item for item in existing
+            if not item.lower().startswith(f"{clean_key} =")
+        ]
+        filtered.append(entry)
+        save_lines(MEMORY_FILE, filtered)
+    except Exception:
+        pass
+
+    return True
+
+
+def retrieve_knowledge(topic):
+    knowledge = _brain_load_json(
+        BRAIN_KNOWLEDGE_FILE,
+        BRAIN_DEFAULT_KNOWLEDGE
+    )
+
+    if not isinstance(knowledge, dict):
+        knowledge = json.loads(json.dumps(BRAIN_DEFAULT_KNOWLEDGE))
+
+    target = _brain_key(topic)
+
+    if target in knowledge:
+        return knowledge[target]
+
+    learning = _brain_load_json(
+        BRAIN_LEARNING_FILE,
+        {"aliases": {}, "responses": {}}
+    )
+
+    aliases = learning.get("aliases", {}) if isinstance(learning, dict) else {}
+
+    if isinstance(aliases, dict):
+        canonical = aliases.get(target)
+        if canonical:
+            canonical_key = _brain_key(canonical)
+            if canonical_key in knowledge:
+                return knowledge[canonical_key]
+
+    target_tokens = set(_brain_tokens(topic))
+    best_key = None
+    best_score = 0.0
+
+    for stored_key in knowledge:
+        stored_tokens = set(_brain_tokens(stored_key.replace("_", " ")))
+        overlap = (
+            len(target_tokens & stored_tokens) /
+            max(1, len(target_tokens | stored_tokens))
+        )
+        sequence = difflib.SequenceMatcher(
+            None,
+            target,
+            stored_key
+        ).ratio()
+        score = max(overlap, sequence)
+
+        if score > best_score:
+            best_score = score
+            best_key = stored_key
+
+    if best_key is not None and best_score >= 0.76:
+        return knowledge[best_key]
+
+    return None
+
+
+def learn(text):
+    raw = str(text or "").strip()
+    normalized = normalize_text(raw)
+
+    response_match = re.match(
+        r'when i say\s+["\'](.+?)["\'],?\s+(?:respond with|say)\s+["\'](.+?)["\']$',
+        raw,
+        re.IGNORECASE
+    )
+
+    if response_match:
+        phrase = response_match.group(1).strip()
+        response = response_match.group(2).strip()
+
+        data = _brain_load_json(
+            BRAIN_LEARNING_FILE,
+            {"aliases": {}, "responses": {}}
+        )
+
+        if not isinstance(data, dict):
+            data = {"aliases": {}, "responses": {}}
+
+        data.setdefault("responses", {})[_brain_key(phrase)] = response
+        _brain_save_json(BRAIN_LEARNING_FILE, data)
+        return "Learned that response rule."
+
+    alias_match = re.match(
+        r"(?:add alias)\s+(.+?)\s+(?:for|to)\s+(.+)$",
+        normalized
+    )
+
+    if alias_match:
+        alias = _brain_key(alias_match.group(1))
+        canonical = _brain_key(alias_match.group(2))
+
+        data = _brain_load_json(
+            BRAIN_LEARNING_FILE,
+            {"aliases": {}, "responses": {}}
+        )
+
+        if not isinstance(data, dict):
+            data = {"aliases": {}, "responses": {}}
+
+        data.setdefault("aliases", {})[alias] = canonical
+        _brain_save_json(BRAIN_LEARNING_FILE, data)
+        return f"Learned alias {alias} for {canonical}."
+
+    stripped = re.sub(
+        r"^(?:learn that|learn|teach yourself|remember|memorize|save this|store this)\s+",
+        "",
+        normalized,
+        count=1
+    ).strip()
+
+    match = re.match(
+        r"(.+?)\s+(?:is|are|means|equals)\s+(.+)$",
+        stripped
+    )
+
+    if match:
+        key = _brain_key(match.group(1))
+        value = match.group(2).strip()
+
+        if save_memory(key, value):
+            knowledge = _brain_load_json(
+                BRAIN_KNOWLEDGE_FILE,
+                BRAIN_DEFAULT_KNOWLEDGE
+            )
+
+            if not isinstance(knowledge, dict):
+                knowledge = json.loads(json.dumps(BRAIN_DEFAULT_KNOWLEDGE))
+
+            knowledge[key] = {"value": value}
+            _brain_save_json(BRAIN_KNOWLEDGE_FILE, knowledge)
+            return f"Learned {key}."
+
+    return None
+
+
+def _brain_known_response(text):
+    data = _brain_load_json(
+        BRAIN_LEARNING_FILE,
+        {"aliases": {}, "responses": {}}
+    )
+
+    if not isinstance(data, dict):
+        return None
+
+    responses = data.get("responses", {})
+    if not isinstance(responses, dict):
+        return None
+
+    normalized = normalize_text(text)
+
+    for phrase_key, response in responses.items():
+        phrase = str(phrase_key).replace("_", " ").strip()
+        if phrase and (
+            normalized == phrase or
+            _brain_has_phrase(normalized, phrase)
+        ):
+            return str(response)
+
+    return None
+
+
+def _brain_load_state():
+    default = {
+        "current_activity": "",
+        "last_subject": "",
+        "last_request": "",
+        "last_intent": "",
+        "last_result": None,
+        "recent_context": [],
+    }
+
+    state_file = DATA_DIR / "brain_state.json"
+    state = _brain_load_json(state_file, default)
+
+    if not isinstance(state, dict):
+        state = default
+
+    state.setdefault("current_activity", "")
+    state.setdefault("last_subject", "")
+    state.setdefault("last_request", "")
+    state.setdefault("last_intent", "")
+    state.setdefault("last_result", None)
+    state.setdefault("recent_context", [])
+
+    return state
+
+
+def _brain_save_state(state):
+    state_file = DATA_DIR / "brain_state.json"
+    _brain_save_json(state_file, state)
+
+
+def _brain_last_context():
+    state = _brain_load_state()
+    recent = state.get("recent_context", [])
+    if not isinstance(recent, list):
+        return []
+    return recent[-12:]
+
+
+def _brain_store_context(user_text, normalized, intent, response, entities):
+    state = _brain_load_state()
+    recent = state.get("recent_context", [])
+
+    if not isinstance(recent, list):
+        recent = []
+
+    entry = {
+        "user": str(user_text).strip(),
+        "normalized": normalized,
+        "intent": intent,
+        "response": response,
+        "topic": entities.get("subject") or entities.get("topic") or "",
+        "activity": entities.get("activity") or "",
+    }
+
+    recent.append(entry)
+    state["recent_context"] = recent[-12:]
+    state["last_request"] = str(user_text).strip()
+    state["last_intent"] = intent
+
+    if entities.get("subject"):
+        state["last_subject"] = str(entities["subject"])
+
+    if entities.get("activity"):
+        state["current_activity"] = str(entities["activity"])
+
+    if BRAIN_LAST_RESULT is not None:
+        state["last_result"] = BRAIN_LAST_RESULT
+
+    _brain_save_state(state)
+
+
+def _brain_recent_activity():
+    state = _brain_load_state()
+    activity = str(state.get("current_activity") or "").strip()
+
+    if activity:
+        return activity
+
+    recent = state.get("recent_context", [])
+    if isinstance(recent, list):
+        for entry in reversed(recent):
+            if not isinstance(entry, dict):
+                continue
+
+            activity = str(entry.get("activity") or "").strip()
+            if activity:
+                return activity
+
+            intent = entry.get("intent")
+            topic = str(entry.get("topic") or "").strip()
+            user_text = str(entry.get("user") or "").strip()
+
+            if intent == "CONTEXT_UPDATE" and user_text:
+                return user_text
+
+            if intent == "CALCULATION":
+                return "doing a calculation"
+
+            if intent == "QUESTION" and topic and not _brain_question_about_self(user_text):
+                return f"looking into {topic}"
+
+            if intent == "REQUEST" and user_text:
+                return user_text
+
+    try:
+        history = get_history_entries()
+    except Exception:
+        history = []
+
+    for line in reversed(history):
+        match = re.match(r"^\[[^\]]+\]\s+\[[^\]]+\]\s+(.*)$", line.strip())
+        if match:
+            command = match.group(1).strip()
+            if command and command not in {"history", "history show", "!!", "repeat"}:
+                return f"using {command}"
+
+    return ""
+
+
+def _brain_recent_summary():
+    recent = _brain_last_context()
+    useful = []
+
+    for entry in reversed(recent):
+        if not isinstance(entry, dict):
+            continue
+
+        user_text = str(entry.get("user") or "").strip()
+        if not user_text:
+            continue
+
+        intent = str(entry.get("intent") or "")
+        topic = str(entry.get("topic") or "").strip()
+        activity = str(entry.get("activity") or "").strip()
+
+        if intent in {"GREETING", "GOODBYE", "MEMORY_REQUEST"}:
+            continue
+
+        if intent == "QUESTION" and _brain_question_about_self(user_text):
+            continue
+
+        if activity:
+            description = activity
+        elif intent == "CALCULATION":
+            description = "a calculation"
+        elif topic:
+            description = f"a question about {topic}"
+        else:
+            description = user_text
+
+        if description not in useful:
+            useful.append(description)
+
+        if len(useful) >= 3:
+            break
+
+    return useful
+
+
+def _brain_recent_request():
+    state = _brain_load_state()
+    request = str(state.get("last_request") or "").strip()
+
+    if request:
+        return request
+
+    recent = _brain_last_context()
+    if recent:
+        last = recent[-1]
+        if isinstance(last, dict):
+            return str(last.get("user") or "").strip()
+
+    return ""
+
+
+def _brain_format_number(value):
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    return str(value)
+
+
+def _brain_resolve_last_result():
+    global BRAIN_LAST_RESULT
+
+    if BRAIN_LAST_RESULT is not None:
+        return BRAIN_LAST_RESULT
+
+    state = _brain_load_state()
+    value = state.get("last_result")
+
+    if isinstance(value, (int, float)):
+        BRAIN_LAST_RESULT = value
+        return value
+
+    return None
+
+
+def reason(text, entities=None):
+    global BRAIN_LAST_RESULT
+
+    normalized = _brain_remove_leading_prefix(text)
+    entities = entities or extract_entities(text)
+
+    comparison = entities.get("comparison")
+    if comparison:
+        left, relation, right = comparison
+
+        if relation in {"greater than", "above"}:
+            result = left > right
+        elif relation in {"less than", "below"}:
+            result = left < right
+        elif relation == "equal to":
+            result = left == right
+        elif relation == "at least":
+            result = left >= right
+        elif relation == "at most":
+            result = left <= right
+        else:
+            result = None
+
+        if result is not None:
+            BRAIN_LAST_RESULT = result
+            return str(result)
+
+    last_result = _brain_resolve_last_result()
+
+    contextual_patterns = [
+        (r"multiply that by\s+(-?\d+(?:\.\d+)?)", "multiply"),
+        (r"divide that by\s+(-?\d+(?:\.\d+)?)", "divide"),
+        (r"add that to\s+(-?\d+(?:\.\d+)?)", "add"),
+        (r"subtract that from\s+(-?\d+(?:\.\d+)?)", "subtract_from"),
+    ]
+
+    if last_result is not None:
+        for pattern, operation in contextual_patterns:
+            match = re.search(pattern, normalized)
+            if not match:
+                continue
+
+            operand = float(match.group(1))
+
+            try:
+                if operation == "multiply":
+                    result = float(last_result) * operand
+                elif operation == "divide":
+                    if operand == 0:
+                        return "I cannot divide by zero."
+                    result = float(last_result) / operand
+                elif operation == "add":
+                    result = float(last_result) + operand
+                else:
+                    result = operand - float(last_result)
+            except Exception:
+                continue
+
+            if isinstance(result, float) and result.is_integer():
+                result = int(result)
+
+            BRAIN_LAST_RESULT = result
+            return _brain_format_number(result)
+
+        if _brain_has_phrase(normalized, "double that"):
+            result = float(last_result) * 2
+            if result.is_integer():
+                result = int(result)
+            BRAIN_LAST_RESULT = result
+            return _brain_format_number(result)
+
+        if _brain_has_phrase(normalized, "triple that"):
+            result = float(last_result) * 3
+            if result.is_integer():
+                result = int(result)
+            BRAIN_LAST_RESULT = result
+            return _brain_format_number(result)
+
+        if _brain_has_phrase(normalized, "half that"):
+            result = float(last_result) / 2
+            if result.is_integer():
+                result = int(result)
+            BRAIN_LAST_RESULT = result
+            return _brain_format_number(result)
+
+    expression = entities.get("math_expression")
+    if expression:
+        try:
+            result = safe_calc(expression)
+            if isinstance(result, float) and result.is_integer():
+                result = int(result)
+            BRAIN_LAST_RESULT = result
+            return _brain_format_number(result)
+        except Exception:
+            pass
+
+    normalized_math = re.sub(r"^(?:what is|calculate|compute|solve)\s+", "", normalized)
+    normalized_math = normalized_math.strip(" ?!")
+
+    replacements = [
+        (r"\bplus\b", "+"),
+        (r"\bminus\b", "-"),
+        (r"\btimes\b", "*"),
+        (r"\bmultiplied\s+by\b", "*"),
+        (r"\bdivided\s+by\b", "/"),
+    ]
+
+    for pattern, replacement in replacements:
+        normalized_math = re.sub(pattern, replacement, normalized_math)
+
+    normalized_math = re.sub(r"[^0-9+\-*/%^(). ]", "", normalized_math)
+
+    if (
+        normalized_math and
+        any(ch.isdigit() for ch in normalized_math) and
+        any(op in normalized_math for op in "+-*/%^")
+    ):
+        try:
+            result = safe_calc(normalized_math)
+            if isinstance(result, float) and result.is_integer():
+                result = int(result)
+            BRAIN_LAST_RESULT = result
+            return _brain_format_number(result)
+        except Exception:
+            pass
+
+    numbers = entities.get("numbers", [])
+
+    if len(numbers) >= 2:
+        try:
+            if _brain_has_phrase(normalized, "add") or _brain_has_phrase(normalized, "plus"):
+                result = numbers[0] + numbers[1]
+                BRAIN_LAST_RESULT = result
+                return _brain_format_number(result)
+
+            if _brain_has_phrase(normalized, "subtract") or _brain_has_phrase(normalized, "minus"):
+                result = numbers[0] - numbers[1]
+                BRAIN_LAST_RESULT = result
+                return _brain_format_number(result)
+
+            if _brain_has_phrase(normalized, "multiply") or _brain_has_phrase(normalized, "times"):
+                result = numbers[0] * numbers[1]
+                BRAIN_LAST_RESULT = result
+                return _brain_format_number(result)
+
+            if _brain_has_phrase(normalized, "divide"):
+                if numbers[1] == 0:
+                    return "I cannot divide by zero."
+                result = numbers[0] / numbers[1]
+                if result.is_integer():
+                    result = int(result)
+                BRAIN_LAST_RESULT = result
+                return _brain_format_number(result)
+        except Exception:
+            pass
+
+    return None
+
+
+def _brain_memory_response(text, entities):
+    normalized = _brain_remove_leading_prefix(text)
+
+    if entities.get("memory_key") and entities.get("memory_value"):
+        if save_memory(
+            entities["memory_key"],
+            entities["memory_value"]
+        ):
+            return maybe_address_user("Saved that.", chance=0.2)
+
+    if _brain_has_any_phrase(normalized, {
+        "what do you know about me",
+        "what do you remember about me",
+        "what did i tell you",
+    }):
+        memories = check_memory()
+        if isinstance(memories, dict) and memories:
+            items = list(memories.items())[-5:]
+            text_items = [
+                f"{key.replace('_', ' ')} = {value}"
+                for key, value in items
+            ]
+            return maybe_address_user(
+                "I remember: " + "; ".join(text_items) + ".",
+                chance=0.15
+            )
+
+        return maybe_address_user(
+            "I do not have any useful personal memories saved yet.",
+            chance=0.15
+        )
+
+    memory_match = re.match(
+        r"^(?:what is|what are|do you remember|tell me)\s+(?:my|about my)\s+(.+?)\s*[?!.]?$",
+        normalized
+    )
+
+    if memory_match:
+        key_text = memory_match.group(1).strip()
+        value = check_memory(key_text)
+
+        if value is not None:
+            return maybe_address_user(
+                f"Your {key_text} is {value}.",
+                chance=0.2
+            )
+
+        return maybe_address_user(
+            "I do not have that saved yet.",
+            chance=0.2
+        )
+
+    if normalized.startswith((
+        "remember ",
+        "memorize ",
+        "save this ",
+        "store this ",
+        "learn ",
+        "teach yourself ",
+        "add alias ",
+        "when i say ",
+    )):
+        learned = learn(text)
+        if learned:
+            return maybe_address_user(learned, chance=0.15)
+
+        return maybe_address_user(
+            "I need a fact or rule in a form I can save.",
+            chance=0.2
+        )
+
+    activity = _brain_recent_activity()
+
+    if _brain_has_any_phrase(normalized, {
+        "what was i doing",
+        "what am i doing",
+        "what was i working on",
+        "what am i working on",
+        "what were we doing",
+        "what are we doing",
+        "what were we working on",
+        "remind me what i was doing",
+        "what was that about",
+        "what were we working on",
+    }):
+        if activity:
+            return maybe_address_user(
+                f"You were working on {activity}.",
+                chance=0.2
+            )
+
+        recent_summary = _brain_recent_summary()
+        if recent_summary:
+            return maybe_address_user(
+                "Recently, you were working on " +
+                ", ".join(recent_summary) + ".",
+                chance=0.15
+            )
+
+        return maybe_address_user(
+            "I do not have enough recent context to tell yet.",
+            chance=0.15
+        )
+
+    if _brain_has_any_phrase(normalized, {
+        "what did we just do",
+        "what did we talk about",
+        "what were we talking about",
+        "what happened just now",
+    }):
+        recent_summary = _brain_recent_summary()
+        if recent_summary:
+            return maybe_address_user(
+                "Recently, you were working on " +
+                ", ".join(recent_summary) + ".",
+                chance=0.15
+            )
+
+        return maybe_address_user(
+            "I do not have enough recent context yet.",
+            chance=0.15
+        )
+
+    if _brain_has_any_phrase(normalized, {
+        "what was the last thing i asked",
+        "what did i just ask",
+        "what was my last question",
+    }):
+        request = _brain_recent_request()
+        if request:
+            return maybe_address_user(
+                f'Your last request was "{request}".',
+                chance=0.1
+            )
+
+        return maybe_address_user(
+            "I do not have a recent request recorded.",
+            chance=0.15
+        )
+
+    if _brain_has_any_phrase(normalized, {
+        "continue that",
+        "continue this",
+        "keep going",
+        "where were we",
+        "pick up where we left off",
+    }):
+        if activity:
+            return maybe_address_user(
+                f"We were working on {activity}.",
+                chance=0.2
+            )
+
+        request = _brain_recent_request()
+        if request:
+            return maybe_address_user(
+                f'We were last working from this request: "{request}".',
+                chance=0.1
+            )
+
+        return maybe_address_user(
+            "I do not have enough context to continue that yet.",
+            chance=0.15
+        )
+
+    return None
+
+
+def generate_response(text, intent, entities, result=None):
+    known = _brain_known_response(text)
+    if known:
+        return known
+
+    normalized = _brain_remove_leading_prefix(text).strip(" ?!.,")
+
+    if result is not None:
+        return maybe_address_user(result, chance=0.15)
+
+    if intent == "GREETING":
+        return maybe_address_user(
+            random.choice([
+                "Hello.",
+                "Hello, sir.",
+                "Hi, sir.",
+                "Hey. How can I help?",
+            ]),
+            chance=0.0
+        )
+
+    if intent == "GOODBYE":
+        return maybe_address_user(
+            random.choice([
+                "Goodbye.",
+                "See you later, sir.",
+                "Understood. Goodbye.",
+            ]),
+            chance=0.0
+        )
+
+    if intent == "HELP":
+        return maybe_address_user(
+            "I can understand natural requests, calculate, remember facts, use local knowledge, track recent context, and learn simple rules.",
+            chance=0.1
+        )
+
+    if intent == "CONTEXT_UPDATE" and entities.get("activity"):
+        return maybe_address_user(
+            "Got it. I will keep that in context.",
+            chance=0.15
+        )
+
+    if normalized in {
+        "what is your name",
+        "who are you",
+        "what are you",
+    }:
+        return maybe_address_user(
+            "I am SOAR, the Script Optimization and Automation Runtime.",
+            chance=0.2
+        )
+
+    if _brain_has_any_phrase(normalized, {
+        "how are you",
+        "how is it going",
+        "how are things",
+        "everything good",
+        "you doing alright",
+        "are you okay",
+    }):
+        activity = _brain_recent_activity()
+        if activity:
+            return maybe_address_user(
+                f"I'm operating normally. We are currently working on {activity}.",
+                chance=0.15
+            )
+
+        return maybe_address_user(
+            random.choice([
+                "I'm operating normally, sir.",
+                "Systems are running normally.",
+                "Everything is running normally on my side.",
+            ]),
+            chance=0.0
+        )
+
+    if _brain_has_any_phrase(normalized, {
+        "what are you doing",
+        "are you there",
+    }):
+        return maybe_address_user(
+            "I'm here and ready for your next request.",
+            chance=0.1
+        )
+
+    if _brain_has_any_phrase(normalized, {
+        "thanks",
+        "thank you",
+        "thx",
+        "appreciate it",
+    }):
+        return maybe_address_user("No problem.", chance=0.25)
+
+    if _brain_has_any_phrase(normalized, {
+        "you are welcome",
+        "no problem",
+        "nice",
+        "cool",
+        "awesome",
+        "good job",
+        "that makes sense",
+        "makes sense",
+    }):
+        return maybe_address_user(
+            random.choice([
+                "Understood.",
+                "Glad that makes sense.",
+                "Good.",
+                "Acknowledged.",
+            ]),
+            chance=0.1
+        )
+
+    if _brain_has_any_phrase(normalized, {
+        "what time is it",
+        "current time",
+        "what is the time",
+    }):
+        return maybe_address_user(
+            f"It is {datetime.now().strftime('%I:%M %p')}.",
+            chance=0.15
+        )
+
+    if _brain_has_any_phrase(normalized, {
+        "what date is it",
+        "what is the date",
+        "today's date",
+        "current date",
+    }):
+        return maybe_address_user(
+            f"Today is {datetime.now().strftime('%A, %B %d, %Y')}.",
+            chance=0.15
+        )
+
+    if _brain_has_any_phrase(normalized, {
+        "tell me a joke",
+        "joke",
+    }):
+        return maybe_address_user(
+            random.choice([
+                "Why do programmers like dark mode? Because light attracts bugs.",
+                "I told my PC a joke. It responded with a cache of laughter.",
+                "Why was the computer tired? It had too many tabs open? Too many tabs.",
+            ]),
+            chance=0.1
+        )
+
+    topic = entities.get("topic")
+    if topic:
+        knowledge = retrieve_knowledge(topic)
+        if knowledge is not None:
+            if isinstance(knowledge, dict):
+                if "name" in knowledge:
+                    return maybe_address_user(
+                        str(knowledge["name"]),
+                        chance=0.2
+                    )
+
+                if "type" in knowledge:
+                    return maybe_address_user(
+                        f"{topic.replace('_', ' ')} is a {knowledge['type']}.",
+                        chance=0.2
+                    )
+
+                if "value" in knowledge:
+                    return maybe_address_user(
+                        str(knowledge["value"]),
+                        chance=0.2
+                    )
+
+                return maybe_address_user(
+                    json.dumps(knowledge, ensure_ascii=False),
+                    chance=0.1
+                )
+
+            return maybe_address_user(
+                str(knowledge),
+                chance=0.2
+            )
+
+    if intent == "QUESTION":
+        return maybe_address_user(
+            "I'm not sure what you mean, sir.",
+            chance=0.0
+        )
+
+    if intent == "REQUEST":
+        return maybe_address_user(
+            "I do not have a local rule for that yet, sir.",
+            chance=0.0
+        )
+
+    return maybe_address_user(
+        "I'm not sure what you mean, sir.",
+        chance=0.0
+    )
+
+
+BRAIN_LAST_RESULT = None
+BRAIN_CONTEXT = []
+BRAIN_CONTEXT_LIMIT = 12
+
+
+def soar_brain(user_text):
+    global BRAIN_CONTEXT
+
+    original_text = str(user_text or "").strip()
+    normalized = normalize_text(original_text)
+
+    if not normalized:
+        return "Say something and I will answer."
+
+    intent = detect_intent(original_text)
+    entities = extract_entities(original_text)
+    response = None
+
+    if intent in {"MEMORY_SAVE", "MEMORY_REQUEST"} or entities.get("memory_key"):
+        response = _brain_memory_response(original_text, entities)
+
+    if response is None:
+        result = None
+
+        if intent in {
+            "CALCULATION",
+            "QUESTION",
+            "REQUEST",
+            "UNKNOWN",
+        }:
+            result = reason(original_text, entities)
+
+        response = generate_response(
+            original_text,
+            intent,
+            entities,
+            result=result
+        )
+
+    if entities.get("activity"):
+        state = _brain_load_state()
+        state["current_activity"] = entities["activity"]
+        _brain_save_state(state)
+
+    BRAIN_CONTEXT.append(
+        {
+            "user": original_text,
+            "normalized": normalized,
+            "intent": intent,
+            "response": response,
+            "topic": entities.get("subject") or entities.get("topic") or "",
+            "activity": entities.get("activity") or "",
+        }
+    )
+
+    if len(BRAIN_CONTEXT) > BRAIN_CONTEXT_LIMIT:
+        BRAIN_CONTEXT = BRAIN_CONTEXT[-BRAIN_CONTEXT_LIMIT:]
+
+    _brain_store_context(
+        original_text,
+        normalized,
+        intent,
+        response,
+        entities
+    )
+
+    return response
 
 def reply_to(user_text):
     
@@ -1713,7 +3447,8 @@ def reply_to(user_text):
             print(f"  Storage Cap:  {used // (2**30)}GB Used / {total // (2**30)}GB Total")
             
             try:
-                import psutil
+                if psutil is None:
+                    raise RuntimeError("psutil is not installed")
                 p = psutil.Process(os.getpid())
                 print(f"  SOAR CPU:     {p.cpu_percent(interval=0.1):.1f}%")
                 print(f"  SOAR RAM:     {p.memory_percent():.1f}%")
@@ -1736,8 +3471,10 @@ def reply_to(user_text):
         return maybe_address_user(random.choice(facts))
 
     if text == "chess" or text.startswith("chess "):
-        import chess # type: ignore
-        import random
+        try:
+            import chess  # type: ignore
+        except ImportError:
+            return maybe_address_user("Chess support is unavailable because python-chess is not installed.")
 
         try:
             speak("Choose Difficulty 1 to 10")
@@ -1787,32 +3524,6 @@ def reply_to(user_text):
         elif board.is_stalemate() or board.is_insufficient_material():
             return "The chess game ended in a draw!"
 
-    
-    if text.startswith("check file ") or text.startswith("checkfile "):
-        
-        parts = text.split(" ", 2)
-        if len(parts) < 3:
-            return maybe_address_user("Please specify the file to analyze. Example: check file my_project/main.py")
-            
-        
-        filename = parts[2].strip()
-        target_path = PROJECTS_DIR / filename
-        
-        if not target_path.exists():
-            return maybe_address_user(f"I couldn't find a file at the path '{filename}' inside your Projects folder.")
-            
-        if target_path.is_dir():
-            return maybe_address_user("The path points to a directory. Please specify a Python file instead.")
-            
-        if not target_path.suffix.lower() == ".py":
-            return maybe_address_user("Right now, my syntax assistant optimization specializes in Python (.py) files.")
-            
-        print("\n--- SOAR CODE ANALYSIS ENGINE ---")
-        result = analyze_code_syntax(target_path)
-        print(result)
-        print("---------------------------------\n")
-        
-        return maybe_address_user("Code scanning sequence completed.")
     
     if text.startswith("create project py") or text.startswith("create python project"):
         try:
@@ -2291,6 +4002,8 @@ def reply_to(user_text):
             return maybe_address_user("I encountered an error creating the Java project.")
         
     if text == "rsms run" or text == "resource monitor":
+        if SOAR_LIGHTWEIGHT_MODE or "RSMS" in SOAR_DISABLED_MODULES:
+            return maybe_address_user("RSMS is disabled while SOAR is in lightweight mode.")
         try:
             import importlib
             import rsms # type: ignore
@@ -2412,24 +4125,6 @@ def reply_to(user_text):
                 return "Error: Trait value must be a number between 0.0 and 1.0."
         else:
             return "Usage format: set personality [trait] [0.0 - 1.0]"
-        
-    if text == "sysinfo" or text == "system resources":
-        try:
-            print("\n================ SOAR SYSTEM DIAGNOSTICS ================")
-            print(f" OS Family:   {platform.system()} {platform.release()}")
-            print(f" Architecture:{platform.machine()}")
-            print(f" Processor:   {platform.processor() or 'Detected x86/ARM Engine'}")
-            print(f" Host Name:   {platform.node()}")
-            
-            import shutil
-            total, used, free = shutil.disk_usage("/")
-            print(f" Storage Cap: {used // (2**30)}GB Used / {total // (2**30)}GB Total")
-            print("=========================================================")
-            
-            return maybe_address_user("Local system profile overview complete.")
-        except Exception as e:
-            print(f"Diagnostics Error: {e}")
-            return maybe_address_user("I am unable to poll your hardware diagnostic sensors at this moment.")
 
     if text.startswith("import ") or text.startswith("importfile "):
         try:
@@ -2855,92 +4550,10 @@ def reply_to(user_text):
             break
 
     if not matched_local:
-        try:
-            import os
-            api_key = "API_KEY_HERE" # Replace with your actual API key
-
-            if api_key:
-                messages_payload = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are SOAR (Script Optimization and Automation Runtime), an advanced, intelligent local desktop AI assistant "
-                            "created by Philip Kluz. You are running on a Mac/Windows. You are a custom automated runtime helper built with pure Python.\n\n"
-                            "Your current system specifications and architectural capabilities include:\n"
-                            "- Version: 1.00.9 Early Beta.\n"
-                            "- AVSS (Anti Virus SOAR Software): A localized, active protection shield running on a daemon thread monitoring background processes and providing security hardening.\n"
-                            "- ACHDS (Advanced Code Helper Diagnostic System): Files outside of soar if upon users request can be fixed.\n"
-                            "- CSRS (Connection Server Request System): Can try to widen signal of wifi or network, can also give diagnostics on the wifi.\n"
-                            "- SPA (SOAR Project Assistant): Can create bases using prompts.\n"
-                            "- File & Workspace Access: You directly manage folders and track local assets under the root directory 'soar_data' containing local tracking structures (notes.txt, memories.txt, todos.txt, chat_log.txt), and the user's primary project space at '~/SOAR/Projects'.\n"
-                        )
-                    }
-                ]
-
-                try:
-                    log_path = os.path.join(os.path.dirname(__file__), "soar_data", "chat_log.txt")
-                    if os.path.exists(log_path):
-                        with open(log_path, "r", encoding="utf-8") as f:
-                            lines = f.readlines()
-                        
-                        recent_lines = [line.strip() for line in lines[-12:] if line.strip()]
-                        
-                        for line in recent_lines:
-                            if "USER:" in line:
-                                clean_content = line.split("USER:")[-1].strip()
-                                if clean_content:
-                                    messages_payload.append({"role": "user", "content": clean_content})
-                            elif "SOAR:" in line:
-                                clean_content = line.split("SOAR:")[-1].strip()
-                                if clean_content:
-                                    messages_payload.append({"role": "assistant", "content": clean_content})
-                except Exception as log_err:
-                    print("[SOAR AI] Could not read chat_log.txt:", log_err)
-
-                messages_payload.append({"role": "user", "content": text})
-
-                payload = {
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": messages_payload,
-                    "temperature": 0.7,
-                    "max_tokens": 200
-                }
-
-                req = urllib.request.Request(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                    },
-                    method="POST"
-                )
-
-                ctx = ssl_context if 'ssl_context' in locals() or 'ssl_context' in globals() else None
-
-                with urllib.request.urlopen(req, context=ctx, timeout=10) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-                    reply = data["choices"][0]["message"]["content"].strip()
-
-                    if reply:
-                        generic_reply = reply
-                        category_type = "generic"
-            else:
-                print("[SOAR AI] Skipped Groq: GROQ_API_KEY environment variable not set.")
-
-        except urllib.error.HTTPError as e:
-            print("HTTP ERROR CODE:", e.code)
-            print("RESPONSE:", e.read().decode())          
-
-        except Exception as e:
-            print("Groq Error:", e)
-
-    if not generic_reply:
-        generic_reply = "I'm online, sir. Let me know what you need."
-
-    final_reply = apply_personality_traits(generic_reply, category_type)
-    return maybe_address_user(final_reply)
+        groq_response = groq_chat(user_text)
+        if groq_response:
+            return groq_response
+        return soar_brain(user_text)
 
 
 
@@ -3108,15 +4721,10 @@ def cmd_newfile(rest):
     content = " ".join(parts[1:]) if len(parts) > 1 else ""
     
     try:
-        p = Path(file_path_str).expanduser()
-        
-        if is_protected_path(p):
-            print("Cannot overwrite protected SOAR system files.")
-            return
-            
+        p = normalize_path(file_path_str, allow_create=True)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        print(f"Created new file at {p.absolute()}")
+        print(f"Created new file at {p}")
     except Exception as e:
         print(f"Error creating file: {e}")
 
@@ -3446,6 +5054,12 @@ def force_hard_exit():
     except Exception:
         pass
 
+    if soar_avss and hasattr(soar_avss, "release_single_instance_lock"):
+        try:
+            soar_avss.release_single_instance_lock()
+        except Exception:
+            pass
+
     sys.exit(0)
 
 
@@ -3608,12 +5222,1851 @@ def emergency_shutdown():
 
     print("\nEMERGENCY SHUTDOWN")
 
+    if soar_avss and hasattr(soar_avss, "release_single_instance_lock"):
+        try:
+            soar_avss.release_single_instance_lock()
+        except Exception:
+            pass
+
     try:
         os._exit(0)
     except Exception:
         sys.exit(0)
 
-def process_command(raw, from_voice=False): #mods start 2
+DEFAULT_PROFILES = {
+    "default": {
+        "voice": True,
+        "disabled_modules": [],
+        "safe_mode": False,
+        "autocode": False,
+        "auto_lightweight": True,
+        "resource_limits": None,
+    },
+    "gaming": {
+        "voice": False,
+        "disabled_modules": ["AUTOCODE", "RSMS", "CSRS"],
+        "safe_mode": False,
+        "autocode": False,
+        "auto_lightweight": True,
+        "resource_limits": {"ram_bytes": None, "cpu_percent": 85, "gpu_percent": 95},
+    },
+    "coding": {
+        "voice": True,
+        "disabled_modules": ["RSMS"],
+        "safe_mode": False,
+        "autocode": True,
+        "auto_lightweight": True,
+        "resource_limits": None,
+    },
+    "lightweight": {
+        "voice": False,
+        "disabled_modules": ["AUTOCODE", "VOICE", "RSMS", "CSRS", "AVSS"],
+        "safe_mode": False,
+        "autocode": False,
+        "auto_lightweight": False,
+        "resource_limits": None,
+    },
+}
+
+KNOWN_COMMAND_ROOTS = {
+    "help", "exit", "quit", "bye", "shutdown", "power", "clear", "time", "date",
+    "uptime", "ping", "say", "message", "calc", "note", "notes", "remember",
+    "memories", "forget", "search", "todo", "remind", "timer", "pomodoro", "shell",
+    "read", "write", "open", "openurl", "copy", "paste", "ip", "status", "voice",
+    "listen", "code", "mkdir", "newfile", "projects", "data", "logs", "history",
+    "repeat", "alias", "profile", "schedule", "app", "apps", "workspace", "ws",
+    "module", "modules", "diagnostics", "diag", "recovery", "event", "events",
+    "clipboard", "clip", "project", "safe", "control", "center", "dashboard",
+    "cc", "autocode", "build", "check", "sysinfo", "report", "weather", "quote",
+    "git", "json", "dep", "fact", "story", "chess", "rsms", "resource", "lightmode",
+    "limitres", "achds", "csrs", "avss", "browse",
+}
+
+def _json_load(path, default):
+    try:
+        if path.exists() and path.read_text(encoding="utf-8").strip():
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value
+    except Exception as e:
+        print(f"[FEATURE DATA ERROR] {path.name}: {e}")
+    return default
+
+def _json_save(path, value):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
+        return True
+    except Exception as e:
+        print(f"[FEATURE DATA ERROR] Could not save {path.name}: {e}")
+        return False
+
+def emit_event(name, payload=None):
+    event_name = str(name or "UNKNOWN").strip().upper().replace(" ", "_")
+    event = {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "event": event_name,
+        "payload": payload if payload is not None else {},
+    }
+    try:
+        with EVENT_LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+    for handler in list(EVENT_HANDLERS.get(event_name, [])):
+        try:
+            handler(event)
+        except Exception as e:
+            print(f"[EVENT HANDLER ERROR] {event_name}: {e}")
+    return event
+
+def register_event_handler(name, handler):
+    key = str(name).strip().upper().replace(" ", "_")
+    EVENT_HANDLERS.setdefault(key, []).append(handler)
+
+def show_recent_events(count=20):
+    try:
+        count = max(1, min(200, int(count)))
+    except Exception:
+        count = 20
+
+    if not EVENT_LOG_FILE.exists():
+        print("No SOAR events recorded yet.")
+        return
+
+    lines = EVENT_LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
+    if not lines:
+        print("No SOAR events recorded yet.")
+        return
+
+    print("\n--- SOAR EVENT LOG ---")
+    for line in lines[-count:]:
+        try:
+            item = json.loads(line)
+            print(f"[{item.get('time', '?')}] {item.get('event', 'UNKNOWN')} | {item.get('payload', {})}")
+        except Exception:
+            print(line)
+    print("----------------------\n")
+
+def record_module_failure(name, error):
+    module = str(name or "CORE").upper()
+    info = MODULE_HEALTH.setdefault(
+        module,
+        {"status": "unknown", "failures": 0, "last_error": "", "last_error_time": ""},
+    )
+    info["status"] = "failed"
+    info["failures"] = int(info.get("failures", 0)) + 1
+    info["last_error"] = str(error)
+    info["last_error_time"] = datetime.now().isoformat(timespec="seconds")
+    emit_event("MODULE_FAILURE", {"module": module, "error": str(error)})
+    try:
+        _json_save(DATA_DIR / "module_health.json", MODULE_HEALTH)
+    except Exception:
+        pass
+
+def record_module_success(name, note=""):
+    module = str(name or "CORE").upper()
+    info = MODULE_HEALTH.setdefault(
+        module,
+        {"status": "unknown", "failures": 0, "last_error": "", "last_error_time": ""},
+    )
+    info["status"] = "healthy"
+    if note:
+        info["last_note"] = note
+
+def load_module_health():
+    global MODULE_HEALTH
+    saved = _json_load(DATA_DIR / "module_health.json", {})
+    if isinstance(saved, dict):
+        for key, value in saved.items():
+            if key in MODULE_HEALTH and isinstance(value, dict):
+                MODULE_HEALTH[key].update(value)
+
+def get_profiles():
+    profiles = _json_load(PROFILES_FILE, {})
+    changed = False
+    if not isinstance(profiles, dict):
+        profiles = {}
+    for name, cfg in DEFAULT_PROFILES.items():
+        if name not in profiles or not isinstance(profiles[name], dict):
+            profiles[name] = dict(cfg)
+            changed = True
+    if changed:
+        _json_save(PROFILES_FILE, profiles)
+    return profiles
+
+def get_active_profile():
+    try:
+        settings = load_settings()
+        return str(settings.get("active_profile", "default") or "default").strip().lower()
+    except Exception:
+        return "default"
+
+def save_active_profile(name):
+    settings = load_settings()
+    settings["active_profile"] = name
+    save_settings(settings)
+
+def get_module_overrides():
+    settings = load_settings()
+    raw = settings.get("module_overrides", [])
+    if not isinstance(raw, list):
+        return set()
+    return {str(x).upper() for x in raw if str(x).strip()}
+
+def save_module_overrides(modules):
+    settings = load_settings()
+    settings["module_overrides"] = sorted({str(x).upper() for x in modules})
+    save_settings(settings)
+
+def module_is_disabled(name):
+    return str(name).upper() in SOAR_DISABLED_MODULES
+
+def module_is_enabled(name):
+    return not module_is_disabled(name)
+
+def apply_module_disable_state(profile_disabled=None):
+    global SOAR_MANUAL_DISABLED_MODULES
+    profile_disabled = profile_disabled or []
+    SOAR_MANUAL_DISABLED_MODULES = {str(x).upper() for x in profile_disabled}
+    SOAR_MANUAL_DISABLED_MODULES.update(get_module_overrides())
+    SOAR_DISABLED_MODULES.clear()
+    SOAR_DISABLED_MODULES.update(SOAR_MANUAL_DISABLED_MODULES)
+
+def start_avss_module():
+    if SOAR_SAFE_MODE or not module_is_enabled("AVSS"):
+        return False
+    if soar_avss is None:
+        record_module_failure("AVSS", "AVSS module is not available")
+        return False
+
+    try:
+        avss_stop_event.clear()
+        avss_entry = getattr(soar_avss, "run_avss_loop", None)
+        if callable(avss_entry):
+            try:
+                threading.Thread(
+                    target=avss_entry,
+                    args=(avss_stop_event, 5),
+                    daemon=True,
+                    name="SOAR-AVSS",
+                ).start()
+            except TypeError:
+                threading.Thread(
+                    target=avss_entry,
+                    daemon=True,
+                    name="SOAR-AVSS",
+                ).start()
+            record_module_success("AVSS")
+            emit_event("MODULE_STARTED", {"module": "AVSS"})
+            print("[SOAR] AVSS Protection Shield active.")
+            return True
+
+        avss_main = getattr(soar_avss, "main", None)
+        if callable(avss_main):
+            threading.Thread(target=avss_main, daemon=True, name="SOAR-AVSS").start()
+            record_module_success("AVSS")
+            emit_event("MODULE_STARTED", {"module": "AVSS"})
+            print("[SOAR] AVSS Protection Shield active.")
+            return True
+
+        record_module_failure("AVSS", "No compatible AVSS entry point")
+        print("[SOAR] AVSS module loaded, but no compatible entry point was found.")
+        return False
+    except Exception as e:
+        record_module_failure("AVSS", e)
+        print(f"[SOAR] AVSS failed to start: {e}")
+        return False
+
+def restart_module(name):
+    module = str(name or "").upper()
+    if module not in MODULE_HEALTH:
+        return False, f"Unknown module: {module}"
+
+    SOAR_MANUAL_DISABLED_MODULES.discard(module)
+    SOAR_DISABLED_MODULES.discard(module)
+    save_module_overrides(SOAR_MANUAL_DISABLED_MODULES)
+
+    try:
+        if module == "VOICE":
+            enable_voice()
+            record_module_success("VOICE")
+            emit_event("MODULE_RESTARTED", {"module": module})
+            return True, "Voice restarted."
+        if module == "AUTOCODE":
+            autocode_stop.clear()
+            global autocode_enabled
+            autocode_enabled = bool(autocode_connected())
+            record_module_success("AUTOCODE")
+            emit_event("MODULE_RESTARTED", {"module": module})
+            return True, "Autocode restarted."
+        if module == "AVSS":
+            ok = start_avss_module()
+            return (ok, "AVSS restarted." if ok else "AVSS restart failed.")
+        if module in {"RSMS", "CSRS"}:
+            record_module_success(module)
+            emit_event("MODULE_RESTARTED", {"module": module})
+            return True, f"{module} is available again."
+        if module == "CORE":
+            record_module_success("CORE")
+            return True, "Core recovery state reset."
+    except Exception as e:
+        record_module_failure(module, e)
+        return False, f"{module} restart failed: {e}"
+
+    return False, f"No restart handler for {module}."
+
+def show_module_status():
+    print("\n================ SOAR MODULE MANAGER ================")
+    modules = ["CORE", "VOICE", "AUTOCODE", "AVSS", "RSMS", "CSRS"]
+    for module in modules:
+        info = MODULE_HEALTH.get(module, {})
+        if module_is_disabled(module):
+            state = "DISABLED"
+        else:
+            state = str(info.get("status", "READY")).upper()
+        extra = ""
+        if module == "AUTOCODE":
+            extra = f" | connected={'yes' if autocode_connected() else 'no'}"
+        elif module == "AVSS":
+            extra = f" | loaded={'yes' if soar_avss else 'no'}"
+        elif module == "RSMS":
+            extra = f" | loaded={'yes' if rsms else 'no'}"
+        print(f"  {module:<8} {state:<10} failures={info.get('failures', 0)}{extra}")
+    print("=====================================================")
+
+def module_manager_command(rest):
+    parts = shlex.split(rest or "")
+    if not parts:
+        show_module_status()
+        return
+
+    action = parts[0].lower()
+    if action in {"status", "list", "show"}:
+        show_module_status()
+        return
+    if action in {"on", "enable", "start", "restart"}:
+        if len(parts) < 2:
+            print("Usage: module on|off|restart <module>")
+            return
+        module = parts[1].upper()
+        if module not in MODULE_HEALTH:
+            print(f"Unknown module: {module}")
+            return
+        if action == "restart":
+            ok, msg = restart_module(module)
+            print(msg)
+            return
+
+        if SOAR_SAFE_MODE and module in {"AUTOCODE", "AVSS", "VOICE"}:
+            print("Safe mode: that module cannot be enabled until safe mode is off.")
+            return
+        SOAR_MANUAL_DISABLED_MODULES.discard(module)
+        SOAR_DISABLED_MODULES.discard(module)
+        save_module_overrides(SOAR_MANUAL_DISABLED_MODULES)
+        if module == "AVSS":
+            start_avss_module()
+        elif module == "VOICE":
+            enable_voice()
+        elif module == "AUTOCODE":
+            global autocode_enabled
+            autocode_enabled = autocode_connected()
+            autocode_stop.clear()
+        record_module_success(module, "enabled manually")
+        emit_event("MODULE_ENABLED", {"module": module})
+        print(f"{module} enabled.")
+        return
+
+    if action in {"off", "disable", "stop"}:
+        if len(parts) < 2:
+            print("Usage: module on|off|restart <module>")
+            return
+        module = parts[1].upper()
+        if module == "CORE":
+            print("CORE cannot be disabled.")
+            return
+        SOAR_MANUAL_DISABLED_MODULES.add(module)
+        SOAR_DISABLED_MODULES.add(module)
+        save_module_overrides(SOAR_MANUAL_DISABLED_MODULES)
+        _stop_optional_module(module)
+        emit_event("MODULE_DISABLED", {"module": module})
+        print(f"{module} disabled.")
+        return
+
+    print("Usage: module status | module on <name> | module off <name> | module restart <name>")
+
+def list_modules_command():
+    show_module_status()
+
+def load_aliases():
+    aliases = _json_load(ALIASES_FILE, {})
+    return aliases if isinstance(aliases, dict) else {}
+
+def save_aliases(aliases):
+    _json_save(ALIASES_FILE, aliases)
+
+def expand_alias(raw, max_depth=5):
+    current = raw.strip()
+    seen = set()
+    for _ in range(max_depth):
+        try:
+            parts = shlex.split(current)
+        except ValueError:
+            return current
+        if not parts:
+            return current
+        key = parts[0].lower()
+        aliases = load_aliases()
+        target = aliases.get(key)
+        if not isinstance(target, str) or not target.strip() or key in seen:
+            return current
+        seen.add(key)
+        suffix = " ".join(parts[1:])
+        current = target.strip()
+        if suffix:
+            current += " " + suffix
+    return current
+
+def alias_command(rest):
+    aliases = load_aliases()
+    parts = shlex.split(rest or "")
+    if not parts:
+        if not aliases:
+            print("No aliases configured.")
+            return
+        print("\nAliases:")
+        for key, value in sorted(aliases.items()):
+            print(f"  {key} = {value}")
+        return
+
+    action = parts[0].lower()
+    if action in {"list", "show"}:
+        if not aliases:
+            print("No aliases configured.")
+            return
+        for key, value in sorted(aliases.items()):
+            print(f"  {key} = {value}")
+        return
+
+    if action in {"remove", "rm", "delete"}:
+        if len(parts) < 2:
+            print("Usage: alias remove <name>")
+            return
+        key = parts[1].lower()
+        if key in aliases:
+            aliases.pop(key)
+            save_aliases(aliases)
+            print(f"Alias '{key}' removed.")
+        else:
+            print(f"Alias '{key}' does not exist.")
+        return
+
+    if action in {"add", "set"}:
+        if len(parts) < 3:
+            print('Usage: alias add <name> <command>')
+            return
+        key = parts[1].lower()
+        value = " ".join(parts[2:]).strip()
+        if value.startswith("="):
+            value = value[1:].strip()
+        aliases[key] = value
+        save_aliases(aliases)
+        print(f"Alias saved: {key} = {value}")
+        return
+
+    key = parts[0].lower()
+    value = " ".join(parts[1:]).strip()
+    if value.startswith("="):
+        value = value[1:].strip()
+    if not value:
+        print(f"Alias '{key}' = {aliases.get(key, '(not set)')}")
+        return
+    aliases[key] = value
+    save_aliases(aliases)
+    print(f"Alias saved: {key} = {value}")
+
+def record_command_history(raw, source="terminal"):
+    entry = str(raw).strip()
+    if not entry:
+        return
+    if len(entry) > 1000:
+        entry = entry[:1000] + " ..."
+    try:
+        lines = COMMAND_HISTORY_FILE.read_text(encoding="utf-8", errors="ignore").splitlines() if COMMAND_HISTORY_FILE.exists() else []
+        stamp_value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        safe_entry = entry.replace("\n", " ")
+        lines.append(f"[{stamp_value}] [{source}] {safe_entry}")
+        lines = lines[-COMMAND_HISTORY_LIMIT:]
+        COMMAND_HISTORY_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+def get_history_entries():
+    if not COMMAND_HISTORY_FILE.exists():
+        return []
+    return COMMAND_HISTORY_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+def history_command(rest):
+    sub = (rest or "").strip()
+    if sub.lower() == "clear":
+        COMMAND_HISTORY_FILE.write_text("", encoding="utf-8")
+        print("Command history cleared.")
+        return
+    if sub.lower().startswith("search "):
+        term = sub[7:].strip().lower()
+        matches = [x for x in get_history_entries() if term in x.lower()]
+        for line in matches[-50:]:
+            print(line)
+        if not matches:
+            print("No matching history entries.")
+        return
+    try:
+        count = max(1, min(100, int(sub))) if sub else 20
+    except ValueError:
+        count = 20
+    entries = get_history_entries()
+    if not entries:
+        print("Command history is empty.")
+        return
+    print("\n--- COMMAND HISTORY ---")
+    start = max(0, len(entries) - count)
+    for idx, line in enumerate(entries[start:], start=start + 1):
+        print(f"{idx:>4}: {line}")
+    print("-----------------------")
+
+def repeat_command(rest):
+    entries = get_history_entries()
+    if not entries:
+        print("Command history is empty.")
+        return
+    try:
+        requested = int(rest.strip()) if rest.strip() else 1
+    except ValueError:
+        requested = 1
+    if requested < 1 or requested > len(entries):
+        print(f"History item must be between 1 and {len(entries)}.")
+        return
+    raw_entry = entries[requested - 1]
+    if "] " in raw_entry:
+        target = raw_entry.split("] ", 1)[1]
+    else:
+        target = raw_entry
+    if not target.strip():
+        print("Selected history item is empty.")
+        return
+    print(f"[SOAR HISTORY] Repeating: {target}")
+    process_command(target, _skip_history=True)
+
+def suggest_command(raw):
+    try:
+        parts = shlex.split(raw)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    root = parts[0].lower()
+    if root in KNOWN_COMMAND_ROOTS:
+        return False
+
+    matches = difflib.get_close_matches(root, sorted(KNOWN_COMMAND_ROOTS), n=3, cutoff=0.72)
+    if not matches:
+        return False
+    print(f"[SOAR] Unknown command '{root}'. Did you mean: {', '.join(matches)}?")
+    return True
+
+def get_saved_workspaces():
+    data = _json_load(WORKSPACES_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+def workspace_command(rest):
+    parts = shlex.split(rest or "")
+    if not parts:
+        data = get_saved_workspaces()
+        if not data:
+            print("No workspaces saved.")
+            return
+        for name, value in sorted(data.items()):
+            print(f"  {name} -> {value}")
+        return
+
+    action = parts[0].lower()
+    data = get_saved_workspaces()
+
+    if action in {"list", "show"}:
+        if not data:
+            print("No workspaces saved.")
+            return
+        for name, value in sorted(data.items()):
+            print(f"  {name} -> {value}")
+        return
+
+    if action in {"open", "load"}:
+        if len(parts) < 2:
+            print("Usage: workspace open <name>")
+            return
+        name = parts[1]
+        if name not in data:
+            print(f"Workspace '{name}' not found.")
+            return
+        path = Path(data[name])
+        if not path.exists():
+            print(f"Workspace path no longer exists: {path}")
+            return
+        open_path(path)
+        print(f"Workspace '{name}' opened.")
+        emit_event("WORKSPACE_OPENED", {"name": name, "path": str(path)})
+        return
+
+    if action in {"remove", "rm", "delete"}:
+        if len(parts) < 2:
+            print("Usage: workspace remove <name>")
+            return
+        name = parts[1]
+        if name in data:
+            data.pop(name)
+            _json_save(WORKSPACES_FILE, data)
+            print(f"Workspace '{name}' removed.")
+        else:
+            print(f"Workspace '{name}' not found.")
+        return
+
+    if action in {"add", "set", "save"}:
+        if len(parts) < 3:
+            print("Usage: workspace add <name> <path>")
+            return
+        name = parts[1]
+        path_text = " ".join(parts[2:]).strip()
+        path = Path(path_text).expanduser()
+        try:
+            path = path.resolve()
+        except Exception:
+            path = path.absolute()
+        if not path.exists() or not path.is_dir():
+            print("Workspace path must be an existing directory.")
+            return
+        data[name] = str(path)
+        _json_save(WORKSPACES_FILE, data)
+        print(f"Workspace saved: {name} -> {path}")
+        return
+
+    name = parts[0]
+    if name not in data:
+        print(f"Workspace '{name}' not found.")
+        return
+    path = Path(data[name])
+    if not path.exists():
+        print(f"Workspace path no longer exists: {path}")
+        return
+    open_path(path)
+    print(f"Workspace '{name}' opened.")
+    emit_event("WORKSPACE_OPENED", {"name": name, "path": str(path)})
+
+def open_path(path):
+    path = Path(path)
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            subprocess.Popen(["open", str(path)])
+        elif system == "Windows":
+            os.startfile(str(path))
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+        return True
+    except Exception as e:
+        print(f"Could not open path: {e}")
+        return False
+
+def resolve_app_alias(name):
+    value = str(name or "").strip()
+    low = value.lower()
+    aliases = {
+        "chrome": "Google Chrome",
+        "google chrome": "Google Chrome",
+        "vscode": "Visual Studio Code",
+        "code": "Visual Studio Code",
+        "vs code": "Visual Studio Code",
+        "terminal": "Terminal",
+        "finder": "Finder",
+        "minecraft": "Minecraft",
+        "discord": "Discord",
+        "spotify": "Spotify",
+        "safari": "Safari",
+        "firefox": "Firefox",
+    }
+    return aliases.get(low, value)
+
+def app_command(rest):
+    parts = shlex.split(rest or "")
+    if not parts:
+        print("Usage: app open|close|find <name>")
+        return
+
+    action = parts[0].lower()
+    target = " ".join(parts[1:]).strip()
+    if action in {"list", "apps"}:
+        list_running_apps()
+        return
+    if not target:
+        print("Please specify an app name.")
+        return
+
+    if SOAR_SAFE_MODE and action in {"open", "close", "restart"}:
+        print("Safe mode: application management is disabled.")
+        return
+
+    if action in {"open", "start", "launch"}:
+        app_name = resolve_app_alias(target)
+        try:
+            if platform.system() == "Darwin":
+                subprocess.Popen(["open", "-a", app_name])
+            elif platform.system() == "Windows":
+                subprocess.Popen(["cmd", "/c", "start", "", app_name])
+            else:
+                subprocess.Popen([app_name])
+            print(f"Opened app: {app_name}")
+            emit_event("APP_OPENED", {"app": app_name})
+        except Exception as e:
+            record_module_failure("CORE", e)
+            print(f"Could not open app '{app_name}': {e}")
+        return
+
+    if action in {"close", "stop", "kill"}:
+        app_name = resolve_app_alias(target)
+        if close_app_processes(app_name):
+            print(f"Close request sent to: {app_name}")
+        else:
+            print(f"No matching user app process found for: {app_name}")
+        return
+
+    if action in {"find", "where"}:
+        matches = find_app_processes(target)
+        if not matches:
+            print("No matching processes found.")
+            return
+        for item in matches:
+            print(item)
+        return
+
+    print("Usage: app open|close|find <name>")
+
+def list_running_apps():
+    seen = set()
+    print("\n--- RUNNING USER APPS ---")
+    try:
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                pid = proc.info.get("pid")
+                name = (proc.info.get("name") or "").strip()
+                if not name or pid == os.getpid():
+                    continue
+                lower = name.lower()
+                if lower in {"launchservicesd", "windowserver", "systemuiserver", "finder"}:
+                    continue
+                key = lower
+                if key in seen:
+                    continue
+                seen.add(key)
+                if any(x in lower for x in (
+                    "chrome", "firefox", "safari", "discord", "spotify", "minecraft",
+                    "code", "terminal", "steam", "slack", "zoom", "obs", "notion",
+                )):
+                    print(f"  {pid:<7} {name}")
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"App listing error: {e}")
+    print("-------------------------")
+
+def find_app_processes(query):
+    query = str(query or "").strip().lower()
+    results = []
+    if not query:
+        return results
+    try:
+        for proc in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                name = str(proc.info.get("name") or "")
+                exe = str(proc.info.get("exe") or "")
+                if query in name.lower() or query in exe.lower():
+                    results.append(f"PID {proc.info.get('pid')}: {name} | {exe}")
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return results
+
+def close_app_processes(target):
+    query = str(target or "").strip().lower()
+    if not query:
+        return False
+    if query in {"terminal", "finder", "soar", "soar_main", "python"}:
+        print("SOAR protected that application from being closed.")
+        return False
+
+    protected_names = {
+        "soar_main.py", "python", "python3", "launchservicesd", "windowserver",
+        "kernel_task", "systemd", "init", "svchost.exe",
+    }
+    matched = []
+    try:
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                pid = proc.info.get("pid")
+                name = str(proc.info.get("name") or "")
+                low = name.lower()
+                if pid == os.getpid() or low in protected_names:
+                    continue
+                if query in low or low == resolve_app_alias(query).lower():
+                    matched.append(proc)
+            except Exception:
+                continue
+
+        if not matched:
+            return False
+
+        for proc in matched:
+            try:
+                proc.terminate()
+            except Exception:
+                continue
+
+        try:
+            psutil.wait_procs(matched, timeout=2)
+        except Exception:
+            pass
+
+        emit_event("APP_CLOSE_REQUEST", {"app": target, "count": len(matched)})
+        return True
+    except Exception as e:
+        record_module_failure("CORE", e)
+        return False
+
+def get_project_target(rest):
+    target = (rest or "").strip().strip('"').strip("'")
+    if not target:
+        return PROJECTS_DIR
+
+    candidate = Path(target).expanduser()
+    candidates = []
+    if candidate.is_absolute():
+        candidates.append(candidate)
+    else:
+        candidates.extend([
+            PROJECTS_DIR / candidate,
+            BASE_DIR / "projects" / candidate,
+            BASE_DIR / candidate,
+        ])
+
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path.absolute()
+        if resolved.exists():
+            return resolved
+    return None
+
+def project_health_command(rest):
+    target = get_project_target(rest)
+    if target is None:
+        print("Project path could not be resolved.")
+        return
+    if target.is_file():
+        target = target.parent
+
+    print("\n================ SOAR PROJECT HEALTH ================")
+    print(f"Project: {target}")
+    py_files = list(target.rglob("*.py"))
+    all_files = [p for p in target.rglob("*") if p.is_file()]
+    print(f"Files: {len(all_files)} | Python: {len(py_files)}")
+
+    pass_count = 0
+    warn_count = 0
+    fail_count = 0
+
+    if py_files:
+        for py in py_files[:500]:
+            try:
+                ast.parse(py.read_text(encoding="utf-8", errors="ignore"))
+                print(f"  PASS  Python syntax: {py.relative_to(target)}")
+                pass_count += 1
+            except SyntaxError as e:
+                print(f"  FAIL  Python syntax: {py.relative_to(target)} -> line {e.lineno}: {e.msg}")
+                fail_count += 1
+            except Exception as e:
+                print(f"  WARN  Could not parse {py.relative_to(target)}: {e}")
+                warn_count += 1
+    else:
+        print("  WARN  No Python files found.")
+        warn_count += 1
+
+    readme = target / "README.md"
+    if readme.exists():
+        print("  PASS  README.md present")
+        pass_count += 1
+    else:
+        print("  WARN  README.md missing")
+        warn_count += 1
+
+    req_file = target / "requirements.txt"
+    if req_file.exists():
+        print("  PASS  requirements.txt present")
+        pass_count += 1
+        try:
+            installed_output = subprocess.run(
+                [sys.executable, "-m", "pip", "list", "--format=freeze"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            ).stdout
+            installed = {
+                line.split("==")[0].lower().replace("_", "-")
+                for line in installed_output.splitlines()
+                if "==" in line
+            }
+            missing = []
+            for line in req_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                item = line.strip()
+                if not item or item.startswith("#"):
+                    continue
+                package = re.split(r"[<>=!~]", item, maxsplit=1)[0].strip().lower().replace("_", "-")
+                if package and package not in installed:
+                    missing.append(package)
+            if missing:
+                print(f"  WARN  Missing requirements: {', '.join(missing[:20])}")
+                warn_count += 1
+            else:
+                print("  PASS  Required packages appear installed")
+                pass_count += 1
+        except Exception as e:
+            print(f"  WARN  Dependency check skipped: {e}")
+            warn_count += 1
+    else:
+        print("  WARN  requirements.txt missing")
+        warn_count += 1
+
+    todo_hits = 0
+    for path in py_files[:500]:
+        try:
+            body = path.read_text(encoding="utf-8", errors="ignore")
+            todo_hits += len(re.findall(r"\b(TODO|FIXME)\b", body, flags=re.IGNORECASE))
+        except Exception:
+            pass
+    if todo_hits:
+        print(f"  WARN  TODO/FIXME markers: {todo_hits}")
+        warn_count += 1
+    else:
+        print("  PASS  No TODO/FIXME markers found")
+        pass_count += 1
+
+    try:
+        oversized = [p for p in all_files if p.stat().st_size > 10 * 1024 * 1024]
+        if oversized:
+            print(f"  WARN  Files over 10 MB: {len(oversized)}")
+            warn_count += 1
+        else:
+            print("  PASS  No files over 10 MB")
+            pass_count += 1
+    except Exception:
+        pass
+
+    git_dir = target / ".git"
+    if git_dir.exists():
+        try:
+            res = subprocess.run(
+                ["git", "-C", str(target), "status", "--short"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            changed = len([x for x in res.stdout.splitlines() if x.strip()])
+            if changed:
+                print(f"  INFO  Git changes detected: {changed}")
+            else:
+                print("  PASS  Git working tree clean")
+                pass_count += 1
+        except Exception:
+            print("  WARN  Git status could not be checked")
+            warn_count += 1
+
+    print(f"\nSummary: PASS={pass_count} WARN={warn_count} FAIL={fail_count}")
+    print("======================================================")
+    emit_event("PROJECT_HEALTH_SCAN", {"project": str(target), "pass": pass_count, "warn": warn_count, "fail": fail_count})
+
+def diagnostics_2_command():
+    print("\n================ SOAR DIAGNOSTICS 2.0 ================")
+    checks = []
+
+    def check(name, ok, detail):
+        state = "PASS" if ok else "WARN"
+        if not ok:
+            print(f"  {state:<4} {name}: {detail}")
+        else:
+            print(f"  {state:<4} {name}: {detail}")
+        checks.append((name, ok))
+
+    check("Python", bool(sys.version_info >= (3, 10)), sys.version.split()[0])
+    check("Platform", True, f"{platform.system()} {platform.release()} / {platform.machine()}")
+    check("psutil", psutil is not None, "loaded" if psutil is not None else "missing")
+    check("TTS", tts_ready.is_set(), tts_voice_label or "not ready")
+    check("Speech", recognizer is not None, "ready" if recognizer else "not ready")
+    check("SOAR Autocode", autocode_connected(), "connected" if autocode_connected() else "offline")
+    check("AVSS", soar_avss is not None, "loaded" if soar_avss else "not loaded")
+    check("RSMS", rsms is not None, "loaded" if rsms else "not loaded")
+    check("Storage", DATA_DIR.exists() and PROJECTS_DIR.exists(), f"{DATA_DIR.name}/ and Projects/")
+    network_ok = _quick_network_check()
+    check("Network", network_ok, "reachable" if network_ok else "unavailable")
+
+    try:
+        ram = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=0.15)
+        disk = __import__("shutil").disk_usage(str(Path.home()))
+        print(f"  INFO CPU: {cpu:.1f}%")
+        print(f"  INFO RAM: {ram.percent:.1f}% ({ram.available / (1024 ** 3):.2f} GB available)")
+        print(f"  INFO Disk: {disk.free / (1024 ** 3):.2f} GB free")
+    except Exception as e:
+        print(f"  WARN Resource sensors: {e}")
+
+    print(f"  INFO Profile: {SOAR_ACTIVE_PROFILE}")
+    print(f"  INFO Safe mode: {'ON' if SOAR_SAFE_MODE else 'OFF'}")
+    print(f"  INFO Auto-lightweight: {'ON' if SOAR_AUTO_LIGHTWEIGHT_ENABLED else 'OFF'}")
+    print("======================================================")
+    emit_event("DIAGNOSTICS_RUN", {"profile": SOAR_ACTIVE_PROFILE})
+
+def _quick_network_check():
+    try:
+        with socket.create_connection(("example.com", 80), timeout=1.5):
+            return True
+    except Exception:
+        return False
+
+def safe_mode_command(rest):
+    global SOAR_SAFE_MODE
+    action = (rest or "").strip().lower()
+    if action in {"on", "enable", "start"}:
+        SOAR_SAFE_MODE = True
+        autocode_stop.set()
+        global autocode_enabled
+        autocode_enabled = False
+        SOAR_DISABLED_MODULES.update({"AUTOCODE"})
+        settings = load_settings()
+        settings["safe_mode"] = True
+        save_settings(settings)
+        emit_event("SAFE_MODE_ON", {})
+        print("SOAR Safe Mode enabled. External/shell-heavy actions are blocked.")
+        return
+
+    if action in {"off", "disable", "stop"}:
+        SOAR_SAFE_MODE = False
+        settings = load_settings()
+        settings["safe_mode"] = False
+        save_settings(settings)
+        SOAR_DISABLED_MODULES.discard("AUTOCODE")
+        autocode_stop.clear()
+        emit_event("SAFE_MODE_OFF", {})
+        print("SOAR Safe Mode disabled.")
+        return
+
+    print(f"Safe mode: {'ON' if SOAR_SAFE_MODE else 'OFF'}")
+    print("Use: safe mode on | safe mode off")
+
+def schedule_parse_due(spec):
+    spec = str(spec or "").strip()
+    now = datetime.now()
+    if spec.lower().startswith("at "):
+        clock = spec[3:].strip()
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})", clock)
+        if not match:
+            raise ValueError("Use time like 18:30.")
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+            raise ValueError("Invalid clock time.")
+        due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if due <= now:
+            due = due.replace(day=due.day) + __import__("datetime").timedelta(days=1)
+        return due.timestamp()
+
+    seconds = parse_duration_seconds(spec)
+    if seconds < 1:
+        raise ValueError("Delay must be at least one second.")
+    return time.time() + seconds
+
+def schedule_load():
+    data = _json_load(SCHEDULE_FILE, [])
+    return data if isinstance(data, list) else []
+
+def schedule_save(tasks):
+    _json_save(SCHEDULE_FILE, tasks)
+
+def schedule_next_id(tasks):
+    ids = []
+    for task in tasks:
+        try:
+            ids.append(int(task.get("id", 0)))
+        except Exception:
+            pass
+    return max(ids, default=0) + 1
+
+def schedule_add_command(spec, command):
+    if not command.strip():
+        print("Usage: schedule add <duration|at HH:MM> <command>")
+        return
+    tasks = schedule_load()
+    task = {
+        "id": schedule_next_id(tasks),
+        "due": schedule_parse_due(spec),
+        "command": command.strip(),
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "status": "pending",
+    }
+    tasks.append(task)
+    schedule_save(tasks)
+    due_text = datetime.fromtimestamp(task["due"]).strftime("%Y-%m-%d %I:%M:%S %p")
+    print(f"Scheduled #{task['id']} for {due_text}: {task['command']}")
+    emit_event("SCHEDULE_ADDED", {"id": task["id"], "command": task["command"], "due": task["due"]})
+
+def schedule_command(rest):
+    parts = shlex.split(rest or "")
+    if not parts:
+        schedule_list_command()
+        return
+
+    action = parts[0].lower()
+    if action in {"list", "show"}:
+        schedule_list_command()
+        return
+
+    if action in {"clear"}:
+        schedule_save([])
+        print("All scheduled tasks cleared.")
+        emit_event("SCHEDULE_CLEARED", {})
+        return
+
+    if action in {"remove", "rm", "delete"}:
+        if len(parts) < 2 or not parts[1].isdigit():
+            print("Usage: schedule remove <id>")
+            return
+        wanted = int(parts[1])
+        tasks = schedule_load()
+        remaining = [x for x in tasks if int(x.get("id", -1)) != wanted]
+        if len(remaining) == len(tasks):
+            print(f"Scheduled task #{wanted} not found.")
+        else:
+            schedule_save(remaining)
+            print(f"Scheduled task #{wanted} removed.")
+        return
+
+    if action == "add":
+        if len(parts) < 3:
+            print("Usage: schedule add <duration|at HH:MM> <command>")
+            return
+        if parts[1].lower() == "at":
+            if len(parts) < 4:
+                print("Usage: schedule add at <HH:MM> <command>")
+                return
+            spec = f"at {parts[2]}"
+            command = " ".join(parts[3:])
+        else:
+            spec = parts[1]
+            command = " ".join(parts[2:])
+        try:
+            schedule_add_command(spec, command)
+        except Exception as e:
+            print(f"Could not schedule task: {e}")
+        return
+
+    if len(parts) >= 2:
+        if parts[0].lower() == "at":
+            if len(parts) < 3:
+                print("Usage: schedule at <HH:MM> <command>")
+                return
+            spec = f"at {parts[1]}"
+            command = " ".join(parts[2:])
+        else:
+            spec = parts[0]
+            command = " ".join(parts[1:])
+        try:
+            schedule_add_command(spec, command)
+        except Exception as e:
+            print(f"Could not schedule task: {e}")
+        return
+
+    print("Usage: schedule add <duration|at HH:MM> <command>")
+
+def schedule_list_command():
+    tasks = schedule_load()
+    if not tasks:
+        print("No scheduled tasks.")
+        return
+    now = time.time()
+    print("\n--- SOAR SCHEDULER ---")
+    for task in sorted(tasks, key=lambda x: float(x.get("due", 0))):
+        try:
+            due = float(task.get("due", 0))
+        except Exception:
+            due = 0
+        status = task.get("status", "pending")
+        when = datetime.fromtimestamp(due).strftime("%Y-%m-%d %I:%M:%S %p")
+        if status == "pending" and due <= now:
+            status = "DUE"
+        print(f"  #{task.get('id')}: {status:<7} {when} -> {task.get('command', '')}")
+    print("----------------------")
+
+def scheduler_loop():
+    global SCHEDULE_THREAD
+    record_module_success("SCHEDULER")
+    while not stop_event.is_set() and not SCHEDULE_STOP_EVENT.is_set():
+        try:
+            tasks = schedule_load()
+            changed = False
+            now = time.time()
+            for task in tasks:
+                if task.get("status") != "pending":
+                    continue
+                try:
+                    due = float(task.get("due", 0))
+                except Exception:
+                    continue
+                if due > now:
+                    continue
+                command = str(task.get("command", "")).strip()
+                task["status"] = "running"
+                changed = True
+                schedule_save(tasks)
+                emit_event("SCHEDULE_FIRED", {"id": task.get("id"), "command": command})
+                try:
+                    process_command(command, _skip_history=True)
+                    task["status"] = "done"
+                    task["completed"] = datetime.now().isoformat(timespec="seconds")
+                    record_module_success("SCHEDULER")
+                except Exception as e:
+                    task["status"] = "failed"
+                    task["error"] = str(e)
+                    record_module_failure("SCHEDULER", e)
+                    print(f"[SCHEDULER ERROR] Task #{task.get('id')}: {e}")
+                changed = True
+            if changed:
+                schedule_save(tasks)
+        except Exception as e:
+            record_module_failure("SCHEDULER", e)
+        stop_event.wait(1.0)
+    SCHEDULE_THREAD = None
+
+def start_scheduler():
+    global SCHEDULE_THREAD
+    if SCHEDULE_THREAD is not None and SCHEDULE_THREAD.is_alive():
+        return
+    SCHEDULE_STOP_EVENT.clear()
+    SCHEDULE_THREAD = threading.Thread(
+        target=scheduler_loop,
+        daemon=True,
+        name="SOAR-Scheduler",
+    )
+    SCHEDULE_THREAD.start()
+
+def clipboard_history_record(content):
+    content = str(content)
+    if not content:
+        return
+    items = _json_load(CLIPBOARD_HISTORY_FILE, [])
+    if not isinstance(items, list):
+        items = []
+    items.append({
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "chars": len(content),
+        "preview": content[:120].replace("\n", "\\n"),
+        "text": content,
+    })
+    _json_save(CLIPBOARD_HISTORY_FILE, items[-CLIPBOARD_HISTORY_LIMIT:])
+
+def clipboard_intelligence_command(rest):
+    parts = shlex.split(rest or "")
+    action = parts[0].lower() if parts else "info"
+
+    if action in {"copy", "set"}:
+        content = " ".join(parts[1:])
+        if not content:
+            print("Usage: clipboard copy <text>")
+            return
+        if clipboard_copy(content):
+            clipboard_history_record(content)
+            print(f"Copied {len(content)} characters.")
+        else:
+            print("Clipboard copy failed.")
+        return
+
+    if action in {"paste", "get"}:
+        content = clipboard_paste()
+        if not content:
+            print("Clipboard empty or unavailable.")
+            return
+        print(content)
+        return
+
+    if action in {"info", "analyze", "analyse"}:
+        content = clipboard_paste()
+        if not content:
+            print("Clipboard empty or unavailable.")
+            return
+        lines = content.splitlines() or [content]
+        words = re.findall(r"\b[\w'-]+\b", content)
+        if re.fullmatch(r"https?://\S+", content.strip()):
+            kind = "URL"
+        elif re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", content.strip()):
+            kind = "EMAIL"
+        else:
+            try:
+                json.loads(content)
+                kind = "JSON"
+            except Exception:
+                if "def " in content or "import " in content or "#!/usr/bin" in content:
+                    kind = "CODE"
+                else:
+                    kind = "TEXT"
+        print("\n--- CLIPBOARD INTELLIGENCE ---")
+        print(f"Type: {kind}")
+        print(f"Characters: {len(content)}")
+        print(f"Words: {len(words)}")
+        print(f"Lines: {len(lines)}")
+        print(f"First line: {lines[0][:200]}")
+        print("------------------------------")
+        return
+
+    if action in {"history", "saved"}:
+        items = _json_load(CLIPBOARD_HISTORY_FILE, [])
+        if not items:
+            print("Clipboard history is empty.")
+            return
+        print("\n--- CLIPBOARD HISTORY ---")
+        for idx, item in enumerate(items[-CLIPBOARD_HISTORY_LIMIT:], 1):
+            print(f"{idx:>2}. [{item.get('time', '?')}] {item.get('chars', 0)} chars | {item.get('preview', '')}")
+        print("-------------------------")
+        return
+
+    if action in {"save"}:
+        content = clipboard_paste()
+        if not content:
+            print("Clipboard empty or unavailable.")
+            return
+        name = "clipboard_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+        if len(parts) > 1:
+            name = "_".join(parts[1:])
+        target = DATA_DIR / "clipboard_saves" / f"{name}.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        clipboard_history_record(content)
+        print(f"Clipboard saved to: {target}")
+        return
+
+    if action in {"clear", "empty"}:
+        clipboard_copy("")
+        print("Clipboard cleared.")
+        return
+
+    print("Usage: clipboard info|copy|paste|history|save|clear")
+
+def profile_command(rest):
+    global SOAR_ACTIVE_PROFILE, SOAR_SAFE_MODE, SOAR_AUTO_LIGHTWEIGHT_ENABLED
+    global SOAR_RESOURCE_LIMITS_ACTIVE, voice_enabled
+    global autocode_enabled, SOAR_DISABLED_MODULES, SOAR_MANUAL_DISABLED_MODULES
+
+    profiles = get_profiles()
+    parts = shlex.split(rest or "")
+    if not parts or parts[0].lower() in {"list", "show"}:
+        print("\nSOAR Profiles:")
+        for name in sorted(profiles):
+            marker = "*" if name == SOAR_ACTIVE_PROFILE else " "
+            print(f" {marker} {name}")
+        print("Use: profile <name>")
+        return
+
+    if parts[0].lower() in {"current", "status"}:
+        print(f"Active profile: {SOAR_ACTIVE_PROFILE}")
+        return
+
+    name = parts[0].lower()
+    if name not in profiles:
+        print(f"Profile '{name}' not found.")
+        print(f"Available: {', '.join(sorted(profiles))}")
+        return
+
+    config = profiles[name]
+    SOAR_ACTIVE_PROFILE = name
+    save_active_profile(name)
+
+    SOAR_SAFE_MODE = bool(config.get("safe_mode", False))
+    SOAR_AUTO_LIGHTWEIGHT_ENABLED = bool(config.get("auto_lightweight", True))
+    apply_module_disable_state(config.get("disabled_modules", []))
+
+    overrides = get_module_overrides()
+    SOAR_MANUAL_DISABLED_MODULES.update(overrides)
+    SOAR_DISABLED_MODULES.update(overrides)
+
+    limits = config.get("resource_limits")
+    if isinstance(limits, dict):
+        with resource_limit_lock:
+            SOAR_RESOURCE_LIMITS["ram_bytes"] = limits.get("ram_bytes")
+            SOAR_RESOURCE_LIMITS["cpu_percent"] = limits.get("cpu_percent")
+            SOAR_RESOURCE_LIMITS["gpu_percent"] = limits.get("gpu_percent")
+            SOAR_RESOURCE_LIMITS_ACTIVE = any(v is not None for v in SOAR_RESOURCE_LIMITS.values())
+            globals()["SOAR_RESOURCE_LIMITS_ACTIVE"] = SOAR_RESOURCE_LIMITS_ACTIVE
+    else:
+        with resource_limit_lock:
+            globals()["SOAR_RESOURCE_LIMITS_ACTIVE"] = False
+            SOAR_RESOURCE_LIMITS["ram_bytes"] = None
+            SOAR_RESOURCE_LIMITS["cpu_percent"] = None
+            SOAR_RESOURCE_LIMITS["gpu_percent"] = None
+
+    autocode_stop.clear()
+    autocode_enabled = bool(config.get("autocode", False) and autocode_connected())
+    if not autocode_enabled:
+        autocode_stop.set()
+
+    desired_voice = bool(config.get("voice", True)) and module_is_enabled("VOICE") and not SOAR_SAFE_MODE
+    if desired_voice:
+        try:
+            if tts_ready.is_set() and recognizer is not None:
+                enable_voice()
+        except Exception as e:
+            record_module_failure("VOICE", e)
+    else:
+        try:
+            disable_voice()
+        except Exception:
+            voice_enabled = False
+
+    if "AVSS" in SOAR_DISABLED_MODULES or SOAR_SAFE_MODE:
+        avss_stop_event.set()
+    else:
+        avss_stop_event.clear()
+
+    emit_event("PROFILE_CHANGED", {"profile": name})
+    print(f"Profile '{name}' applied.")
+    print(f"  Voice: {'on' if desired_voice else 'off'}")
+    print(f"  Autocode: {'on' if autocode_enabled else 'off'}")
+    print(f"  Safe mode: {'on' if SOAR_SAFE_MODE else 'off'}")
+    print(f"  Disabled modules: {', '.join(sorted(SOAR_DISABLED_MODULES)) or 'none'}")
+
+def app_manager_open_short(rest):
+    app_command("open " + (rest or ""))
+
+def app_manager_close_short(rest):
+    app_command("close " + (rest or ""))
+
+def show_control_center():
+    try:
+        cpu = psutil.cpu_percent(interval=0.1)
+        vm = psutil.virtual_memory()
+        disk = __import__("shutil").disk_usage(str(Path.home()))
+        proc = psutil.Process(os.getpid())
+        proc_cpu = proc.cpu_percent(interval=0.05)
+        proc_ram = proc.memory_info().rss / (1024 ** 2)
+    except Exception:
+        cpu, vm, disk, proc_cpu, proc_ram = 0, None, None, 0, 0
+
+    print("\n╔══════════════════════════════════════════════════════╗")
+    print("║                 SOAR CONTROL CENTER                  ║")
+    print("╠══════════════════════════════════════════════════════╣")
+    print(f"║ Profile : {SOAR_ACTIVE_PROFILE:<39}║")
+    print(f"║ Safe    : {'ON' if SOAR_SAFE_MODE else 'OFF':<39}║")
+    print(f"║ Voice   : {'ON' if voice_enabled else 'OFF':<39}║")
+    print(f"║ Auto-LW : {'ON' if SOAR_AUTO_LIGHTWEIGHT_ENABLED else 'OFF':<38}║")
+    print(f"║ Mode    : {'LIGHTWEIGHT' if SOAR_LIGHTWEIGHT_MODE else 'NORMAL':<38}║")
+    if vm is not None:
+        print(f"║ System  : CPU {cpu:>5.1f}% | RAM {vm.percent:>5.1f}%             ║")
+    else:
+        print("║ System  : sensors unavailable                         ║")
+    print(f"║ SOAR    : CPU {proc_cpu:>5.1f}% | RAM {proc_ram:>6.1f} MB         ║")
+    if disk is not None:
+        print(f"║ Disk    : {disk.free / (1024 ** 3):>6.1f} GB free                ║")
+    else:
+        print("║ Disk    : unavailable                                  ║")
+    print("╠══════════════════════════════════════════════════════╣")
+    print("║ 1. Modules                                           ║")
+    print("║ 2. Diagnostics 2.0                                  ║")
+    print("║ 3. Projects                                          ║")
+    print("║ 4. Resources                                         ║")
+    print("║ 5. Profiles                                          ║")
+    print("║ 6. Scheduler                                         ║")
+    print("║ 7. Logs / Events                                     ║")
+    print("╚══════════════════════════════════════════════════════╝")
+
+def control_center_command(rest, from_voice=False):
+    selection = (rest or "").strip()
+    show_control_center()
+    if from_voice or not selection:
+        print("Use: cc 1-7 to open a control panel.")
+        return
+
+    action = selection.split()[0]
+    if action == "1":
+        show_module_status()
+    elif action == "2":
+        diagnostics_2_command()
+    elif action == "3":
+        cmd_projects()
+    elif action == "4":
+        show_status()
+        print(f"System CPU: {psutil.cpu_percent(interval=0.15):.1f}%")
+        print(f"System RAM: {psutil.virtual_memory().percent:.1f}%")
+    elif action == "5":
+        profile_command("list")
+    elif action == "6":
+        schedule_list_command()
+    elif action == "7":
+        show_recent_log(20)
+        show_recent_events(20)
+    else:
+        print("Control selection must be 1 through 7.")
+
+def recovery_command(rest):
+    action = (rest or "").strip().lower()
+    if action in {"run", "restart", "all", "auto"}:
+        restarted = []
+        for module, info in list(MODULE_HEALTH.items()):
+            if (
+                info.get("status") == "failed"
+                and module != "CORE"
+                and not module_is_disabled(module)
+            ):
+                ok, msg = restart_module(module)
+                print(msg)
+                if ok:
+                    restarted.append(module)
+        if not restarted:
+            print("No failed optional modules needed recovery.")
+        emit_event("RECOVERY_RUN", {"restarted": restarted})
+        return
+
+    print("\n--- SOAR CRASH RECOVERY ---")
+    for module, info in MODULE_HEALTH.items():
+        if info.get("status") == "failed":
+            print(f"  FAILED  {module}: {info.get('last_error', 'unknown error')}")
+        else:
+            print(f"  OK      {module}")
+    print("Use: recovery run")
+    print("---------------------------")
+
+def restore_optional_modules_from_profile():
+    """Restore only modules that are allowed by the active profile after lightweight mode."""
+    global autocode_enabled
+    if SOAR_SAFE_MODE:
+        return
+
+    profiles = get_profiles()
+    config = profiles.get(SOAR_ACTIVE_PROFILE, DEFAULT_PROFILES["default"])
+    apply_module_disable_state(config.get("disabled_modules", []))
+
+    if module_is_enabled("VOICE") and bool(config.get("voice", True)):
+        try:
+            if tts_ready.is_set() and recognizer is not None and not voice_enabled:
+                enable_voice()
+                record_module_success("VOICE", "restored after lightweight mode")
+        except Exception as e:
+            record_module_failure("VOICE", e)
+
+    if module_is_enabled("AUTOCODE") and bool(config.get("autocode", False)) and autocode_connected():
+        autocode_stop.clear()
+        autocode_enabled = True
+        record_module_success("AUTOCODE", "restored after lightweight mode")
+
+    if module_is_enabled("AVSS"):
+        try:
+            if avss_stop_event.is_set():
+                start_avss_module()
+        except Exception as e:
+            record_module_failure("AVSS", e)
+
+
+def initialize_feature_runtime():
+    global FEATURE_RUNTIME_READY, SOAR_ACTIVE_PROFILE, SOAR_SAFE_MODE, voice_enabled
+    global SOAR_AUTO_LIGHTWEIGHT_ENABLED, SOAR_MANUAL_DISABLED_MODULES
+    global SOAR_DISABLED_MODULES, autocode_enabled
+
+    if FEATURE_RUNTIME_READY:
+        return
+
+    load_module_health()
+    profiles = get_profiles()
+    SOAR_ACTIVE_PROFILE = get_active_profile()
+    if SOAR_ACTIVE_PROFILE not in profiles:
+        SOAR_ACTIVE_PROFILE = "default"
+        save_active_profile("default")
+
+    config = profiles[SOAR_ACTIVE_PROFILE]
+    SOAR_SAFE_MODE = bool(config.get("safe_mode", False))
+    settings = load_settings()
+    SOAR_SAFE_MODE = bool(settings.get("safe_mode", SOAR_SAFE_MODE))
+
+    SOAR_AUTO_LIGHTWEIGHT_ENABLED = bool(
+        settings.get("auto_lightweight", config.get("auto_lightweight", True))
+    )
+
+    apply_module_disable_state(config.get("disabled_modules", []))
+    SOAR_MANUAL_DISABLED_MODULES.update(get_module_overrides())
+    SOAR_DISABLED_MODULES.update(SOAR_MANUAL_DISABLED_MODULES)
+
+    limits = config.get("resource_limits")
+    if isinstance(limits, dict):
+        with resource_limit_lock:
+            SOAR_RESOURCE_LIMITS["ram_bytes"] = limits.get("ram_bytes")
+            SOAR_RESOURCE_LIMITS["cpu_percent"] = limits.get("cpu_percent")
+            SOAR_RESOURCE_LIMITS["gpu_percent"] = limits.get("gpu_percent")
+            globals()["SOAR_RESOURCE_LIMITS_ACTIVE"] = any(
+                v is not None for v in SOAR_RESOURCE_LIMITS.values()
+            )
+
+    autocode_enabled = bool(
+        config.get("autocode", False) and autocode_connected() and not SOAR_SAFE_MODE
+    )
+    if not autocode_enabled:
+        autocode_stop.set()
+
+    if not (bool(config.get("voice", True)) and module_is_enabled("VOICE") and not SOAR_SAFE_MODE):
+        voice_enabled = False
+    else:
+        voice_enabled = True
+
+    start_scheduler()
+    FEATURE_RUNTIME_READY = True
+    emit_event(
+        "SOAR_FEATURE_RUNTIME_READY",
+        {"profile": SOAR_ACTIVE_PROFILE, "safe_mode": SOAR_SAFE_MODE},
+    )
+
+def auto_lightweight_monitor():
+    global SOAR_AUTO_LIGHTWEIGHT_LOW_SINCE, SOAR_AUTO_LIGHTWEIGHT_ACTIVE
+
+    if not SOAR_AUTO_LIGHTWEIGHT_ENABLED or SOAR_SAFE_MODE:
+        return
+
+    try:
+        vm = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=0.05)
+    except Exception:
+        return
+
+    pressure = vm.percent >= 85.0 or cpu >= 85.0
+    now = time.time()
+
+    if pressure and not SOAR_LIGHTWEIGHT_MODE:
+        SOAR_AUTO_LIGHTWEIGHT_ACTIVE = True
+        SOAR_AUTO_LIGHTWEIGHT_LOW_SINCE = None
+        enter_lightweight_mode(
+            f"automatic resource protection (system CPU {cpu:.1f}%, RAM {vm.percent:.1f}%)"
+        )
+        emit_event("AUTO_LIGHTWEIGHT_ON", {"cpu": cpu, "ram": vm.percent})
+        return
+
+    if SOAR_LIGHTWEIGHT_MODE and SOAR_AUTO_LIGHTWEIGHT_ACTIVE:
+        if vm.percent <= 55.0 and cpu <= 55.0:
+            if SOAR_AUTO_LIGHTWEIGHT_LOW_SINCE is None:
+                SOAR_AUTO_LIGHTWEIGHT_LOW_SINCE = now
+            elif now - SOAR_AUTO_LIGHTWEIGHT_LOW_SINCE >= 20.0:
+                SOAR_AUTO_LIGHTWEIGHT_ACTIVE = False
+                SOAR_AUTO_LIGHTWEIGHT_LOW_SINCE = None
+                leave_lightweight_mode(restore_modules=True)
+                emit_event("AUTO_LIGHTWEIGHT_OFF", {"cpu": cpu, "ram": vm.percent})
+        else:
+            SOAR_AUTO_LIGHTWEIGHT_LOW_SINCE = None
+
+def handle_feature_command(raw, from_voice=False):
+    text = str(raw).strip()
+    lower = text.lower()
+
+    if SOAR_SAFE_MODE and (
+        lower.startswith("shell ")
+        or lower.startswith("app ")
+        or lower.startswith("openurl ")
+        or lower.startswith("report ")
+        or lower.startswith("message ")
+        or lower.startswith("weather")
+        or lower == "quote"
+    ):
+        print("SOAR Safe Mode blocked this external/system action.")
+        return True
+
+    if lower in {"help", "?"}:
+        return False
+
+    if lower in {"history", "history show"}:
+        history_command("")
+        return True
+    if lower.startswith("history "):
+        history_command(text[8:].strip())
+        return True
+    if lower == "!!":
+        repeat_command("1")
+        return True
+    if lower.startswith("repeat"):
+        rest = text[6:].strip()
+        repeat_command(rest)
+        return True
+
+    if lower == "alias" or lower.startswith("alias "):
+        alias_command(text[5:].strip())
+        return True
+
+    if lower == "profile" or lower.startswith("profile "):
+        profile_command(text[7:].strip())
+        return True
+
+    if lower in {"modules", "module"} or lower.startswith("module "):
+        module_manager_command(text[6:].strip())
+        return True
+
+    if lower in {"schedule", "scheduler"} or lower.startswith("schedule ") or lower.startswith("scheduler "):
+        body = text.split(" ", 1)[1] if " " in text else ""
+        schedule_command(body)
+        return True
+
+    if lower in {"what apps are running", "running apps", "list apps"}:
+        list_running_apps()
+        return True
+
+    if lower in {"apps", "app"} or lower.startswith("app ") or lower.startswith("open app ") or lower.startswith("close app "):
+        if lower.startswith("open app "):
+            app_manager_open_short(text[9:].strip())
+        elif lower.startswith("close app "):
+            app_manager_close_short(text[10:].strip())
+        else:
+            body = text.split(" ", 1)[1] if " " in text else ""
+            app_command(body)
+        return True
+
+    if lower.startswith("open ") and not lower.startswith("openurl "):
+        target = text[5:].strip()
+        known_app_names = {"chrome", "google chrome", "firefox", "safari", "minecraft", "discord", "spotify", "terminal", "finder", "vscode", "visual studio code", "code"}
+        if target.lower() in known_app_names:
+            app_manager_open_short(target)
+            return True
+
+    if lower.startswith("close "):
+        target = text[6:].strip()
+        known_app_names = {"chrome", "google chrome", "firefox", "safari", "minecraft", "discord", "spotify", "terminal", "finder", "vscode", "visual studio code", "code"}
+        if target.lower() in known_app_names:
+            app_manager_close_short(target)
+            return True
+
+    if lower.startswith("workspace ") or lower.startswith("ws "):
+        body = text.split(" ", 1)[1] if " " in text else ""
+        workspace_command(body)
+        return True
+    if lower == "workspace" or lower == "ws":
+        workspace_command("")
+        return True
+
+    if lower.startswith("clipboard") or lower.startswith("clip"):
+        if lower.startswith("clipboard"):
+            body = text[9:].strip()
+        else:
+            body = text[4:].strip()
+        clipboard_intelligence_command(body)
+        return True
+
+    if lower in {"diagnostics", "diag", "diagnostics 2", "diag 2", "diagnostics 2.0"}:
+        diagnostics_2_command()
+        return True
+
+    if lower in {"recovery", "crash recovery"} or lower.startswith("recovery "):
+        body = text.split(" ", 1)[1] if " " in text else ""
+        recovery_command(body)
+        return True
+
+    if lower.startswith("project health") or lower.startswith("project scan"):
+        parts = text.split(" ", 2)
+        rest = parts[2] if len(parts) >= 3 else ""
+        project_health_command(rest)
+        return True
+
+    if lower in {"safe mode", "safemode"} or lower.startswith("safe mode "):
+        body = text.split(" ", 2)[2] if len(text.split(" ", 2)) >= 3 else ""
+        safe_mode_command(body)
+        return True
+
+    if lower in {"events", "event log"} or lower.startswith("events "):
+        body = text.split(" ", 1)[1] if " " in text else ""
+        try:
+            count = int(body) if body else 20
+        except ValueError:
+            count = 20
+        show_recent_events(count)
+        return True
+
+    if lower.startswith("event emit "):
+        body = text[11:].strip()
+        chunks = body.split(" ", 1)
+        name = chunks[0]
+        payload = {"message": chunks[1]} if len(chunks) > 1 else {}
+        emit_event(name, payload)
+        print(f"Event emitted: {name}")
+        return True
+
+    if lower in {"control center", "dashboard", "center", "cc"} or lower.startswith("cc ") or lower.startswith("control center "):
+        if lower.startswith("cc "):
+            body = text[3:].strip()
+        elif lower.startswith("control center "):
+            body = text[15:].strip()
+        else:
+            body = ""
+        control_center_command(body, from_voice=from_voice)
+        return True
+
+    if lower in {"auto lightweight", "smart lightweight", "autolw"}:
+        global SOAR_AUTO_LIGHTWEIGHT_ENABLED
+        SOAR_AUTO_LIGHTWEIGHT_ENABLED = not SOAR_AUTO_LIGHTWEIGHT_ENABLED
+        settings = load_settings()
+        settings["auto_lightweight"] = SOAR_AUTO_LIGHTWEIGHT_ENABLED
+        save_settings(settings)
+        print(f"Automatic lightweight mode: {'ON' if SOAR_AUTO_LIGHTWEIGHT_ENABLED else 'OFF'}")
+        emit_event("AUTO_LIGHTWEIGHT_SETTING", {"enabled": SOAR_AUTO_LIGHTWEIGHT_ENABLED})
+        return True
+
+    if suggest_command(text):
+        return True
+
+    return False
+
+def _process_command_wrapper(raw, from_voice=False, _skip_history=False):
+    raw = str(raw or "").strip()
+    if not raw:
+        return
+
+    normalized_raw = raw[1:].strip() if raw.startswith("/") else raw
+    expanded = expand_alias(normalized_raw)
+    if expanded != raw:
+        print(f"[SOAR ALIAS] {raw.split()[0]} -> {expanded}")
+
+    source = "voice" if from_voice else "terminal"
+    command_key = raw.lower().strip()
+    if not _skip_history and command_key not in {"history", "history show", "repeat", "!!"}:
+        record_command_history(raw, source=source)
+
+    emit_event("COMMAND_RECEIVED", {"source": source, "command": expanded[:300]})
+
+    try:
+        if handle_feature_command(expanded, from_voice=from_voice):
+            return
+        _process_command_core(expanded)
+        record_module_success("CORE")
+    except SystemExit:
+        raise
+    except Exception as e:
+        record_module_failure("CORE", e)
+        print(f"[SOAR COMMAND RECOVERY] {type(e).__name__}: {e}")
+        if traceback.format_exc():
+            emit_event("COMMAND_CRASH_RECOVERED", {
+                "command": expanded[:300],
+                "error": str(e),
+            })
+
+def process_command(raw, from_voice=False, _skip_history=False):
+    return _process_command_wrapper(raw, from_voice=from_voice, _skip_history=_skip_history)
+
+def _process_command_core(raw): #mods start 2
     if shutting_down or stop_event.is_set():
         return
 
@@ -3626,42 +7079,303 @@ def process_command(raw, from_voice=False): #mods start 2
 
     if text.startswith("/"):
         text = text[1:]
-    
+
     lower = text.lower()
 
     import sys
+
     if hasattr(sys, "mod_commands"):
-        for command_keyword in sys.mod_commands:
-            if command_keyword in lower:
-                sys.mod_commands[command_keyword]()
-                return
+        try:
+            for command_keyword, command_function in sys.mod_commands.items():
+                if command_keyword.lower() in lower:
+                    try:
+                        command_function()
+                    except TypeError:
+                        try:
+                            command_function(text)
+                        except Exception as e:
+                            print(f"[SOAR MOD] Error running '{command_keyword}': {e}")
+                    except Exception as e:
+                        print(f"[SOAR MOD] Error running '{command_keyword}': {e}")
+                    return
+        except Exception as e:
+            print(f"[SOAR MOD] Command system error: {e}")
 
     try:
         parts = shlex.split(text)
     except Exception:
         parts = text.split()
-        
+
     if not parts:
         return
-        
+
     cmd = parts[0].lower()
+    args = parts[1:]
 
     if cmd == "build":
         prompt_str = " ".join(parts[1:])
+
         if not prompt_str:
             print("[SOAR] Error: Please supply building targets details.")
             print("Usage: build <project parameters detail descriptions>")
             return
-            
-        print(f"[SOAR] Analyzing building prompt blueprints: '{prompt_str}'")
-        
-        agent = ProjectAgent(prompt=prompt_str, project_name="Autonomously_Generated_App")
+
+        print(
+            f"[SOAR] Analyzing building prompt blueprints: "
+            f"'{prompt_str}'"
+        )
+
+        agent = ProjectAgent(
+            prompt=prompt_str,
+            project_name="Autonomously_Generated_App"
+        )
+
         agent.execute_pipeline()
-        return #mods end 2
+        return
+
+    if lower in {
+        "cmd groqkeyon",
+        "cmd groqkeyoff",
+        "cmd groqkeystatus"
+    }:
+        response = handle_user_input("/" + lower)
+
+        print(f"SOAR: {response}")
+
+        try:
+            speak(response, allow_sound=True)
+        except Exception:
+            pass
+
+        return
+
+    try:
+        response = handle_user_input("/" + text)
+
+        if response is not None:
+            print(f"SOAR: {response}")
+
+            try:
+                speak(response, allow_sound=True)
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"[SOAR] Command error: {e}") #mods end 2
 
     shutdown_words = {
         "exit", "quit", "bye", "shut down", "shutdown", "power off", "power down", "poweroff", "turn off"
     }
+
+    if lower in shutdown_words:
+        speak(maybe_address_user("Shutting down now. Goodbye!", chance=0.35), allow_sound=True)
+        sys.exit(0)
+
+    if lower == "pomodoro":
+        speak(
+            maybe_address_user(
+                "Starting Pomodoro timer. 25 minutes of focus.", chance=0.35
+            ),
+            allow_sound=True,
+        )
+        time.sleep(25 * 60)
+        speak(
+            maybe_address_user(
+                "Time's up! Great job. Starting 5-minute break now.", chance=0.35
+            ),
+            allow_sound=True,
+        )
+        time.sleep(5 * 60)
+        speak(
+            maybe_address_user(
+                "Break finished! Ready for the next session.", chance=0.35
+            ),
+            allow_sound=True,
+        )
+        return
+
+    if lower.startswith("weather"):
+        city = " ".join(args) if args else "auto"
+        encoded_city = quote_plus(city)
+        url = f"https://wttr.in/{encoded_city}?format=j1"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                
+                curr = data["current_condition"][0]
+                temp_c = curr.get("temp_C", "N/A")
+                temp_f = curr.get("temp_F", "N/A")
+                
+                precip = curr.get("precipMM", "0.0")
+                desc = curr["weatherDesc"][0]["value"].lower() if curr.get("weatherDesc") else ""
+                
+                is_raining = False
+                rain_intensity = ""
+                if "rain" in desc or "drizzle" in desc or float(precip) > 0:
+                    is_raining = True
+                    precip_val = float(precip)
+                    if precip_val < 0.5:
+                        rain_intensity = " (light)"
+                    elif precip_val < 4.0:
+                        rain_intensity = " (mild)"
+                    else:
+                        rain_intensity = " (heavy)"
+
+                thunder = "Yes" if "thunder" in desc or "storm" in desc else "No"
+
+                severe_chance = 0
+                if "weather" in data and len(data["weather"]) > 0:
+                    hourly = data["weather"][0].get("hourly", [])
+                    if hourly:
+                        chances = [
+                            int(h.get("chanceofsevere", 0)) if "chanceofsevere" in h 
+                            else int(h.get("chanceoftornado", 0)) 
+                            for h in hourly
+                        ]
+                        severe_chance = max(chances) if chances else 0
+
+                report_lines = [
+                    f"Temperature: {temp_f}°F, {temp_c}°C",
+                    f"Precipitation: {precip}mm",
+                    f"Raining: {is_raining}{rain_intensity}",
+                    f"Thunder: {thunder}"
+                ]
+                
+                if is_raining:
+                    report_lines.append(f"Hazardous/Tornado Weather Chance: {severe_chance}%")
+
+                report = "\n".join(report_lines)
+                print(f"\n[SOAR Weather]\n{report}\n")
+                speak(
+                    maybe_address_user("Here is the requested weather report.", chance=0.35),
+                    allow_sound=True,
+                )
+        except Exception:
+            speak(
+                maybe_address_user(
+                    "Sorry, I could not fetch the weather.", chance=0.35
+                ),
+                allow_sound=True,
+            )
+        return
+
+    if lower == "quote":
+        try:
+            url = "https://api.quotable.io/random?tags=technology|wisdom"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req) as response:
+                data = json.loads(response.read().decode("utf-8"))
+                text_out = f"Quote: {data['content']} by {data['author']}"
+                speak(maybe_address_user(text_out, chance=0.35), allow_sound=True)
+        except Exception:
+            speak(
+                maybe_address_user(
+                    "Code is like humor. When you have to explain it, it's bad.",
+                    chance=0.35,
+                ),
+                allow_sound=True,
+            )
+        return
+
+    if lower in ("git status", "git-status"):
+        try:
+            res = subprocess.run(
+                ["git", "status", "-s"], capture_output=True, text=True, check=True
+            )
+            if not res.stdout.strip():
+                msg = "Working tree is clean. No uncommitted changes."
+            else:
+                msg = "You have uncommitted git changes."
+            speak(maybe_address_user(msg, chance=0.35), allow_sound=True)
+        except Exception:
+            speak(
+                maybe_address_user(
+                    "Error: This directory is not a git repository.", chance=0.35
+                ),
+                allow_sound=True,
+            )
+        return
+
+    if lower.startswith("json format") or lower.startswith("json-fmt"):
+        target = " ".join(args)
+        if not target:
+            speak(
+                maybe_address_user(
+                    "Please provide a JSON string or file path.", chance=0.35
+                ),
+                allow_sound=True,
+            )
+            return
+        content = ""
+        if os.path.isfile(target):
+            try:
+                with open(target, "r") as f:
+                    content = f.read()
+            except Exception:
+                speak(
+                    maybe_address_user("Error reading the specified file.", chance=0.35),
+                    allow_sound=True,
+                )
+                return
+        else:
+            content = target
+        try:
+            parsed = json.loads(content)
+            print(json.dumps(parsed, indent=4))
+            speak(
+                maybe_address_user("Valid JSON formatted successfully.", chance=0.35),
+                allow_sound=True,
+            )
+        except json.JSONDecodeError as e:
+            speak(
+                maybe_address_user(f"Invalid JSON: {e.msg}", chance=0.35),
+                allow_sound=True,
+            )
+        return
+
+    if lower in ("dep scan", "dep-scan"):
+        req_file = "requirements.txt"
+        if not os.path.isfile(req_file):
+            speak(
+                maybe_address_user(
+                    "No requirements file found in the current directory.", chance=0.35
+                ),
+                allow_sound=True,
+            )
+            return
+        try:
+            pip_res = subprocess.run(
+                ["pip", "list", "--format=freeze"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            installed = {
+                line.split("==")[0].lower()
+                for line in pip_res.stdout.splitlines()
+                if "==" in line
+            }
+            missing = []
+            with open(req_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    pkg = line.split("==")[0].split(">=")[0].split("<=")[0].strip().lower()
+                    if pkg not in installed:
+                        missing.append(pkg)
+            if not missing:
+                msg = "All requirements are installed."
+            else:
+                msg = f"Missing packages: {', '.join(missing)}"
+            speak(maybe_address_user(msg, chance=0.35), allow_sound=True)
+        except Exception:
+            speak(
+                maybe_address_user("Error scanning dependencies.", chance=0.35),
+                allow_sound=True,
+            )
+        return
 
     if lower in {"help", "?"}:
         show_help()
@@ -4167,6 +7881,8 @@ def process_command(raw, from_voice=False): #mods start 2
             return
         
     if lower.startswith("csrs "):
+        if SOAR_LIGHTWEIGHT_MODE or "CSRS" in SOAR_DISABLED_MODULES:
+            return maybe_address_user("CSRS is disabled while SOAR is in lightweight mode.")
         try:
             import platform
             import subprocess
@@ -4362,6 +8078,9 @@ def process_command(raw, from_voice=False): #mods start 2
         return
 
     if lower in {"autocode on", "start autocode"}:
+        if SOAR_LIGHTWEIGHT_MODE or "AUTOCODE" in SOAR_DISABLED_MODULES:
+            speak("Autocode is disabled while SOAR is in lightweight mode.", allow_sound=True)
+            return
         global autocode_enabled
         autocode_enabled = True
         autocode_stop.clear()
@@ -4906,12 +8625,10 @@ def process_command(raw, from_voice=False): #mods start 2
 
 
 def check_process_resources():
-    return False
-    """
-    Checks if SOAR exceeds safe CPU or RAM usage.
-    Uses cooldown + averaged CPU to prevent spam.
-    """
     global _last_resource_alert
+
+    if psutil is None:
+        return False
 
     try:
         p = psutil.Process(os.getpid())
@@ -4923,15 +8640,14 @@ def check_process_resources():
         cpu_pct = sum(cpu_samples) / len(cpu_samples)
         ram_pct = p.memory_percent()
 
-        now = time.time()
+        high_usage = cpu_pct >= 70.0 or ram_pct >= 40.0
 
-        if cpu_pct >= 25.0 or ram_pct >= 25.0:
-
-            if now - _last_resource_alert >= RESOURCE_COOLDOWN:
-                _last_resource_alert = now
+        if high_usage:
+            if _last_resource_alert == 0:
+                _last_resource_alert = time.time()
 
                 error_msg = (
-                    f"[RESOURCE CRITICAL] SOAR resource threshold exceeded! "
+                    f"[RESOURCE HIGH] SOAR resource usage detected! "
                     f"CPU: {cpu_pct:.1f}%, RAM: {ram_pct:.1f}%"
                 )
 
@@ -4943,11 +8659,15 @@ def check_process_resources():
                     pass
 
                 try:
-                    speak("Warning: High resource usage detected.", allow_sound=True)
+                    speak("High resource usage detected. Reducing SOAR load.", allow_sound=True)
                 except Exception:
                     pass
 
                 return True
+
+            return False
+
+        _last_resource_alert = 0
 
         return False
 
@@ -5125,20 +8845,391 @@ def watch_intro_and_focus():
     except Exception:
         pass
 
+def parse_ram_limit(value):
+    value = value.strip().lower().replace(" ", "")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(kb|mb|gb|tb)", value)
+    if not match:
+        raise ValueError("Use a RAM value like 512MB, 1GB, or 10000KB.")
+
+    number = float(match.group(1))
+    unit = match.group(2)
+    multiplier = {
+        "kb": 1024,
+        "mb": 1024 ** 2,
+        "gb": 1024 ** 3,
+        "tb": 1024 ** 4,
+    }[unit]
+    return int(number * multiplier)
+
+
+def parse_percent_limit(value):
+    value = value.strip().replace("%", "")
+    number = int(value)
+    if not 0 <= number <= 100:
+        raise ValueError("Percentage must be between 0 and 100.")
+    return number
+
+
+def reset_resource_limits_for_boot():
+    """Start every SOAR boot with resource limiting disabled."""
+    global SOAR_RESOURCE_LIMITS_ACTIVE
+
+    with resource_limit_lock:
+        SOAR_RESOURCE_LIMITS_ACTIVE = False
+        SOAR_RESOURCE_LIMITS["ram_bytes"] = None
+        SOAR_RESOURCE_LIMITS["cpu_percent"] = None
+        SOAR_RESOURCE_LIMITS["gpu_percent"] = None
+
+
+def _stop_optional_module(name):
+    """Stop/disable an optional subsystem without stopping SOAR itself."""
+    global autocode_enabled
+
+    name = name.upper()
+    SOAR_DISABLED_MODULES.add(name)
+
+    if name == "AUTOCODE":
+        autocode_enabled = False
+        autocode_stop.set()
+        print("[SOAR LIGHTWEIGHT] Autocode disabled.")
+        return
+
+    if name == "VOICE":
+        try:
+            disable_voice()
+        except Exception as e:
+            print(f"[SOAR LIGHTWEIGHT] Voice stop error: {e}")
+        print("[SOAR LIGHTWEIGHT] Voice input disabled.")
+        return
+
+    if name == "AVSS":
+        avss_stop_event.set()
+        try:
+            for method_name in ("stop", "shutdown", "close"):
+                method = getattr(soar_avss, method_name, None) if soar_avss else None
+                if callable(method):
+                    try:
+                        method()
+                    except TypeError:
+                        pass
+                    break
+        except Exception as e:
+            print(f"[SOAR LIGHTWEIGHT] AVSS stop error: {e}")
+        print("[SOAR LIGHTWEIGHT] AVSS disabled to reduce resource usage.")
+        return
+
+    if name == "CSRS":
+        print("[SOAR LIGHTWEIGHT] CSRS disabled.")
+        return
+
+    if name == "RSMS":
+        print("[SOAR LIGHTWEIGHT] RSMS disabled.")
+        return
+
+
+def enter_lightweight_mode(trigger):
+    """Drop optional features before the hard resource limit is reached."""
+    global SOAR_LIGHTWEIGHT_MODE
+
+    with resource_limit_lock:
+        if SOAR_LIGHTWEIGHT_MODE:
+            return
+        SOAR_LIGHTWEIGHT_MODE = True
+
+    print(f"\n[SOAR LIGHTWEIGHT] Activating lightweight mode: {trigger}")
+    print("[SOAR LIGHTWEIGHT] Shutting down optional resource-heavy modules...")
+
+    for module_name in ("AUTOCODE", "VOICE", "RSMS", "CSRS", "AVSS"):
+        _stop_optional_module(module_name)
+
+    print("[SOAR LIGHTWEIGHT] Lightweight mode active. Core command processing remains online.")
+    emit_event("LIGHTWEIGHT_ON", {"trigger": trigger})
+
+
+def leave_lightweight_mode(restore_modules=True):
+    """Manually or automatically restore optional features after lightweight mode."""
+    global SOAR_LIGHTWEIGHT_MODE
+
+    with resource_limit_lock:
+        SOAR_LIGHTWEIGHT_MODE = False
+        SOAR_DISABLED_MODULES.clear()
+        SOAR_DISABLED_MODULES.update(SOAR_MANUAL_DISABLED_MODULES)
+
+    if "AVSS" not in SOAR_MANUAL_DISABLED_MODULES:
+        avss_stop_event.clear()
+    if "AUTOCODE" not in SOAR_MANUAL_DISABLED_MODULES:
+        autocode_stop.clear()
+
+    print("[SOAR LIGHTWEIGHT] Lightweight mode cleared. Optional modules may be started again.")
+    emit_event("LIGHTWEIGHT_OFF", {"manual_disabled": sorted(SOAR_MANUAL_DISABLED_MODULES)})
+
+    if restore_modules:
+        try:
+            restore_optional_modules_from_profile()
+        except Exception as e:
+            record_module_failure("CORE", e)
+
+
+def configure_resource_limits():
+    print("\n[SOAR] Resource Limit Setup")
+
+    while True:
+        try:
+            ram_text = input("Ram: ")
+            ram_bytes = parse_ram_limit(ram_text)
+            break
+        except ValueError as e:
+            print(f"[SOAR] {e}")
+
+    while True:
+        try:
+            gpu_text = input("GPU:#% ")
+            gpu_percent = parse_percent_limit(gpu_text)
+            break
+        except ValueError as e:
+            print(f"[SOAR] {e}")
+
+    while True:
+        try:
+            cpu_text = input("CPU:#% ")
+            cpu_percent = parse_percent_limit(cpu_text)
+            break
+        except ValueError as e:
+            print(f"[SOAR] {e}")
+
+    global SOAR_RESOURCE_LIMITS_ACTIVE
+
+    with resource_limit_lock:
+        SOAR_RESOURCE_LIMITS["ram_bytes"] = ram_bytes
+        SOAR_RESOURCE_LIMITS["gpu_percent"] = gpu_percent
+        SOAR_RESOURCE_LIMITS["cpu_percent"] = cpu_percent
+        SOAR_RESOURCE_LIMITS_ACTIVE = True
+
+    leave_lightweight_mode()
+
+    print(
+        f"[SOAR] Limits set: RAM={ram_text}, "
+        f"GPU={gpu_percent}%, CPU={cpu_percent}%"
+    )
+    print("[SOAR] Lightweight mode will activate at 80% of a configured limit.")
+    print("[SOAR] SOAR will shut down if the hard limit is reached.")
+    print("[SOAR] These limits apply only to this boot and are cleared on restart.")
+
+    return (
+        f"Resource limits set. RAM {ram_text}, "
+        f"GPU {gpu_percent} percent, CPU {cpu_percent} percent."
+    )
+
+
 def handle_user_input(text, username="User"):
-    if text.startswith("/cmd readypost"):
+    global _last_resource_alert
+
+    command = " ".join(str(text or "").strip().split()).lower()
+
+    if command in {"/cmd groqkeyon", "cmd groqkeyon"}:
+        set_groq_enabled(True)
+        if get_groq_api_key():
+            return "Groq chat enabled. Normal conversation will use Groq; local SOAR chat remains the automatic fallback when Groq is unavailable."
+        return "Groq chat enabled, but no API key is configured. Set GROQ_API_KEY (or groq_api_key in settings.json); SOAR will use local chat until then."
+
+    if command in {"/cmd groqkeyoff", "cmd groqkeyoff"}:
+        set_groq_enabled(False)
+        return "Groq chat disabled. SOAR will use its local chat system."
+
+    if command in {"/cmd groqkeystatus", "cmd groqkeystatus"}:
+        return groq_status_text()
+
+    if command == "/cmd limitres":
+        return configure_resource_limits()
+
+    if command == "/cmd limitres off":
+        global SOAR_RESOURCE_LIMITS_ACTIVE
+        with resource_limit_lock:
+            SOAR_RESOURCE_LIMITS_ACTIVE = False
+            SOAR_RESOURCE_LIMITS["ram_bytes"] = None
+            SOAR_RESOURCE_LIMITS["cpu_percent"] = None
+            SOAR_RESOURCE_LIMITS["gpu_percent"] = None
+        leave_lightweight_mode()
+        return "Resource limits disabled for this boot."
+
+    if command == "/cmd ignorerescap":
+        global RESOURCE_IGNORE
+        RESOURCE_IGNORE = True
+        _last_resource_alert = 0
+        return "Resource warnings disabled."
+
+    if command == "/cmd unignorerescap":
+        RESOURCE_IGNORE = False
+        _last_resource_alert = 0
+        return "Resource warnings enabled."
+
+    if command == "/cmd lightmode":
+        enter_lightweight_mode("manual command")
+        return "Lightweight mode enabled. Optional modules were disabled."
+
+    if command == "/cmd lightmode off":
+        leave_lightweight_mode()
+        return "Lightweight mode cleared."
+
+    if command == "/cmd readypost":
         print("Ready post command executed internally.")
         return f"Post readiness confirmed, {username}."
-    
+
     return f"Processed input: {text}"
+
+
+def get_gpu_utilization_percent():
+    """Return average NVIDIA GPU utilization, or None when unavailable."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+
+    values = []
+    for line in result.stdout.splitlines():
+        value = line.strip().replace("%", "")
+        if not value:
+            continue
+        try:
+            values.append(float(value))
+        except ValueError:
+            continue
+
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def enforce_soar_resource_limits():
+    """Apply only limits explicitly configured during the current boot."""
+    try:
+        with resource_limit_lock:
+            if not SOAR_RESOURCE_LIMITS_ACTIVE:
+                return
+            ram_limit = SOAR_RESOURCE_LIMITS.get("ram_bytes")
+            cpu_limit = SOAR_RESOURCE_LIMITS.get("cpu_percent")
+            gpu_limit = SOAR_RESOURCE_LIMITS.get("gpu_percent")
+
+        p = psutil.Process(os.getpid())
+    except Exception:
+        return
+
+    try:
+        ram_used = p.memory_info().rss
+        cpu_used = p.cpu_percent(interval=0.05)
+
+        if ram_limit is not None and ram_limit > 0:
+            ram_ratio = ram_used / ram_limit
+            if ram_ratio >= 1.0:
+                request_soar_shutdown(
+                    f"SOAR stopped: RAM limit of {ram_limit / (1024 ** 2):.1f} MB reached "
+                    f"({ram_used / (1024 ** 2):.1f} MB used)."
+                )
+                return
+            if ram_ratio >= 0.80:
+                enter_lightweight_mode(
+                    f"RAM at {ram_used / (1024 ** 2):.1f} MB / {ram_limit / (1024 ** 2):.1f} MB"
+                )
+
+        if cpu_limit is not None and cpu_limit > 0:
+            cpu_ratio = cpu_used / cpu_limit
+            if cpu_ratio >= 1.0:
+                request_soar_shutdown(
+                    f"SOAR stopped: CPU limit of {cpu_limit}% reached ({cpu_used:.1f}%)."
+                )
+                return
+            if cpu_ratio >= 0.80:
+                enter_lightweight_mode(
+                    f"CPU at {cpu_used:.1f}% / {cpu_limit}%"
+                )
+
+        if gpu_limit is not None and gpu_limit > 0:
+            gpu_used = get_gpu_utilization_percent()
+            if gpu_used is not None:
+                gpu_ratio = gpu_used / gpu_limit
+                if gpu_ratio >= 1.0:
+                    request_soar_shutdown(
+                        f"SOAR stopped: GPU limit of {gpu_limit}% reached ({gpu_used:.1f}%)."
+                    )
+                    return
+                if gpu_ratio >= 0.80:
+                    enter_lightweight_mode(
+                        f"GPU at {gpu_used:.1f}% / {gpu_limit}%"
+                    )
+
+    except Exception as e:
+        print(f"[RESOURCE LIMIT ERROR] {e}")
+
+
+def request_soar_shutdown(reason="SOAR resource limit reached."):
+    global shutting_down
+
+    if shutting_down:
+        return
+
+    shutting_down = True
+    print(f"\n[SOAR] {reason}")
+    print("[SOAR] Emergency resource shutdown initiated.")
+
+    try:
+        stop_event.set()
+    except Exception:
+        pass
+
+    try:
+        disable_voice()
+    except Exception:
+        pass
+
+    try:
+        autocode_stop.set()
+    except Exception:
+        pass
+
+    try:
+        avss_stop_event.set()
+    except Exception:
+        pass
+
+    try:
+        tts_queue.put_nowait(None)
+    except Exception:
+        pass
+
+    try:
+        if soar_avss and hasattr(soar_avss, "release_single_instance_lock"):
+            soar_avss.release_single_instance_lock()
+    except Exception:
+        pass
+
+    try:
+        emergency_shutdown()
+    except Exception:
+        try:
+            os._exit(0)
+        except Exception:
+            pass
 
 def main():
     if soar_avss and hasattr(soar_avss, "enforce_single_instance"):
-        soar_avss.enforce_single_instance()
+        if not soar_avss.enforce_single_instance():
+            sys.exit(0)
 
     global shutting_down, stop_event
     shutting_down = False
     stop_event = threading.Event()
+    avss_stop_event.clear()
+    reset_resource_limits_for_boot()
 
     system_tasks = [
         ("Database Modules", load_database),
@@ -5162,6 +9253,7 @@ def main():
         threading.Thread(target=watch_intro_and_focus, daemon=True).start()
 
     load_systems(system_tasks)
+    initialize_feature_runtime()
 
     def resource_watchdog_loop():
         while not stop_event.is_set():
@@ -5170,18 +9262,33 @@ def main():
             except Exception as e:
                 print(f"[WATCHDOG ERROR] {e}")
 
-            for _ in range(100):
-                if stop_event.is_set():
-                    break
-                time.sleep(0.1)
+            try:
+                enforce_soar_resource_limits()
+            except Exception as e:
+                print(f"[RESOURCE LIMIT ERROR] {e}")
+
+            try:
+                auto_lightweight_monitor()
+            except Exception as e:
+                record_module_failure("CORE", e)
+
+            stop_event.wait(RESOURCE_WATCHDOG_INTERVAL)
 
     def autocode_loop():
         while not stop_event.is_set():
             try:
-                if autocode_enabled and not autocode_stop.is_set() and autocode_connected():
+                if (
+                    autocode_enabled
+                    and not autocode_stop.is_set()
+                    and autocode_connected()
+                    and module_is_enabled("AUTOCODE")
+                    and not SOAR_SAFE_MODE
+                ):
                     try:
                         soar_autocode.run_cycle("auto running")
+                        record_module_success("AUTOCODE")
                     except Exception as e:
+                        record_module_failure("AUTOCODE", e)
                         print(f"[AUTO ERROR] {e}")
             except Exception as e:
                 print(f"[AUTO ERROR] {e}")
@@ -5211,13 +9318,18 @@ def main():
     print("Voice starts automatically if your mic libraries are ready.\n")
 
     try:
-        speak("SOAR Booted, version 1.00.9. Voice is on.", allow_sound=True)
+        speak("SOAR Booted, version 1.00.10. Voice is on.", allow_sound=True)
     except Exception:
         pass
 
     try:
-        enable_voice()
+        if module_is_enabled("VOICE") and not SOAR_SAFE_MODE:
+            enable_voice()
+            record_module_success("VOICE")
+        else:
+            print("[SOAR] Voice startup skipped by active profile/safe mode.")
     except Exception as e:
+        record_module_failure("VOICE", e)
         print(f"[VOICE ERROR] {e}")
 
     try:
@@ -5225,46 +9337,10 @@ def main():
     except Exception as e:
         print(f"[VOICE WATCHDOG ERROR] {e}")
 
-    def start_avss():
-        if soar_avss is None:
-            print("[SOAR] AVSS module not available.")
-            return
-
-        try:
-            avss_entry = getattr(soar_avss, "run_avss_loop", None)
-
-            if callable(avss_entry):
-                try:
-                    threading.Thread(
-                        target=avss_entry,
-                        args=(stop_event, 5),
-                        daemon=True
-                    ).start()
-                    print("[SOAR] AVSS Protection Shield active.")
-                    return
-                except TypeError:
-                    threading.Thread(
-                        target=avss_entry,
-                        daemon=True
-                    ).start()
-                    print("[SOAR] AVSS Protection Shield active.")
-                    return
-
-            avss_main = getattr(soar_avss, "main", None)
-            if callable(avss_main):
-                threading.Thread(
-                    target=avss_main,
-                    daemon=True
-                ).start()
-                print("[SOAR] AVSS Protection Shield active.")
-                return
-
-            print("[SOAR] AVSS module loaded, but no compatible entry point was found.")
-
-        except Exception as e:
-            print(f"[SOAR] AVSS failed to start: {e}")
-
-    start_avss()
+    if module_is_enabled("AVSS") and not SOAR_SAFE_MODE:
+        start_avss_module()
+    else:
+        print("[SOAR] AVSS startup skipped by active profile/safe mode.")
 
     try:
         while not stop_event.is_set():
@@ -5274,6 +9350,27 @@ def main():
                 raise SystemExit
 
             try:
+                command_key = raw.strip().lower()
+                if command_key in {
+                    "/cmd limitres",
+                    "/cmd limitres off",
+                    "/cmd lightmode",
+                    "/cmd lightmode off",
+                    "/cmd groqkeyon",
+                    "/cmd groqkeyoff",
+                    "/cmd groqkeystatus",
+                }:
+                    try:
+                        response = handle_user_input(raw)
+                        print(f"SOAR: {response}")
+                        try:
+                            speak(response, allow_sound=True)
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        print(f"[RESOURCE COMMAND ERROR] {e}")
+                    continue
+
                 if raw.startswith("/cmd instantintro"):
                     try:
                         settings_data = {}
@@ -5398,6 +9495,12 @@ def main():
             tts_queue.put_nowait(None)
         except Exception:
             pass
+
+        if soar_avss and hasattr(soar_avss, "release_single_instance_lock"):
+            try:
+                soar_avss.release_single_instance_lock()
+            except Exception:
+                pass
 
         time.sleep(0.3)
         print("Shutdown complete.")
